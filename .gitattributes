@@ -1,1 +1,2 @@
 6ab10eb3b23ba_student_resource.zip filter=lfs diff=lfs merge=lfs -text
+output/v1/*.bin binary
