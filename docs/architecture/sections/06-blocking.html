@@ -1,0 +1,176 @@
+<section class="chapter" id="ch-06">
+  <h1><span class="num">6</span> Candidate Generation (Blocking)</h1>
+  <p class="lead">This chapter describes the candidate-generation stage implemented by <code>block()</code>, <code>topk_sparse()</code> and <code>pair_cos()</code>. Blocking replaces the infeasible cross product of Source 1 against Source 2 and Source 3 with a short list of plausible partners per Source 1 record and thereby fixes the recall ceiling of the system. It combines three character n-gram TF-IDF views with an exact-key postal view, partitions by country with an open-set fallback, bounds memory by construction, and, together with the training-side checks in <code>main()</code>, prints diagnostics that show where to act when the ceiling is too low.</p>
+
+  <h2>6.1 Why blocking is needed</h2>
+  <p>The matcher of Chapter 8 scores one pair at a time. Without pre-selection it would score every Source 1 (S1) record against every Source 2 or Source 3 (S2/S3) record, |S1| × |S2+S3| pairs: with, for instance, a few hundred thousand records per side that is 10<sup>10</sup> to 10<sup>11</sup> pairs, infeasible for the string-alignment features of Chapter 7 and hopelessly imbalanced for the classifier. Blocking restricts the comparison space to pairs that share cheap evidence of similarity.</p>
+  <p>Blocking also caps the score. A true partner absent from the candidates of its S1 record can never be predicted; the fraction of ground-truth pairs that survive is the <em>recall ceiling</em>. Under the macro-averaged F<sub>0.5</sub> of Chapter 2 the ceiling bites per entity: an S1 entity with true matches, none of which is blocked, contributes exactly 0.0 whatever the matcher does, while a singleton is unaffected. The stage is therefore designed for recall and leaves precision to the matcher and the decision layer of Chapter 9. The table returned by <code>block()</code> is also, unfiltered, the content of <code>candidate_pairs.tsv</code>, which must be exactly the set the model runs inference over.</p>
+
+  <h2>6.2 Representation: character n-gram TF-IDF</h2>
+  <p>Each view is a <code>TfidfVectorizer</code> with <code>analyzer="char_wb"</code>, <code>ngram_range=(2, 4)</code>, <code>min_df=2</code>, <code>sublinear_tf=True</code> and <code>dtype=np.float32</code>. The <code>char_wb</code> analyser pads each token with a space and emits its character 2-, 3- and 4-grams without crossing token boundaries, so a typo or transposition changes a handful of n-grams and leaves the rest intact, which tolerates the residual noise the tables of Chapter 5 do not cover. <code>min_df=2</code> drops n-grams found in a single document, which can never contribute to a dot product between two records, so the vocabulary shrinks at no cost to recall. <code>sublinear_tf</code> replaces the term frequency tf by 1 + log(tf), so a long address repeating a common n-gram does not dominate its own vector, and float32 halves the memory of the matrices and of the dense chunks of 6.5.</p>
+  <p>The vectoriser is fitted on <code>pd.concat([a, b])</code>, the S1 and S2/S3 texts of the split being processed. Rows are L2-normalised (the default), hence the dot product of two rows is their cosine and one sparse product yields all cosines. Refitting on the test split learns French n-grams from the test records themselves, with no external vocabulary (see Chapter 13).</p>
+
+  <h2>6.3 The four views</h2>
+  <p><code>block()</code> builds three fuzzy views and one exact-key view (Table 6.1). Each fuzzy view vectorises a different text: the core name <code>name_c</code>, the concatenation <code>name_c + " | " + addr_c</code>, and the cleaned address <code>addr_c</code> (Chapter 5). The views are complementary with respect to the noise taxonomy of Chapter 3: the name view finds partners whose address is missing or rewritten; the address view finds partners whose name is a trade name, acronym or heavy abbreviation; the full view ranks highest the pairs on which both fields agree, and its cosine <code>cos_full</code> later drives the rank and gap features of Chapter 7. Depth differs per view: k = 25 for name and full, because near-duplicate names (chain branches, common words) are frequent and the true branch must stay in the list; k = 10 for address, because addresses are shared by many businesses and an address-only neighbour is weak evidence.</p>
+  <p>The fourth view is exact-key. Within a country block, S2/S3 records are grouped by their extracted <code>postal</code> code; for every S1 postal group with a matching S2/S3 group, the name-view vectors of the two groups are compared and the top k<sub>postal</sub> = 10 by name cosine are kept (empty codes are skipped). This recovers matches whose name is too noisy for the country-wide top 25: inside one ZIP or PIN group the competition is the postal group rather than the whole country, so the same name cosine is far more discriminative. The view is silent for records whose address carries no 5- or 6-digit code (<code>postal</code> is then empty, Chapter 5), so it complements the fuzzy views rather than replacing them.</p>
+
+  <table class="tbl">
+    <caption>Table 6.1 — Blocking views and their parameters as set in <code>block()</code>.</caption>
+    <thead><tr><th>View</th><th>S1 text</th><th>S2/S3 text</th><th>Search space</th><th>k</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>name</code></td><td><code>name_c</code></td><td><code>name_c</code></td><td>same country block</td><td>25</td><td>address missing or rewritten</td></tr>
+      <tr><td><code>full</code></td><td><code>name_c + " | " + addr_c</code></td><td>same</td><td>same country block</td><td>25</td><td>both fields agree; source of <code>cos_full</code></td></tr>
+      <tr><td><code>addr</code></td><td><code>addr_c</code></td><td><code>addr_c</code></td><td>same country block</td><td>10</td><td>trade name, acronym, rewritten name</td></tr>
+      <tr><td>postal</td><td><code>name_c</code> (name vectoriser)</td><td><code>name_c</code></td><td>same country and identical <code>postal</code></td><td>10</td><td>noisy name inside one ZIP/PIN</td></tr>
+      <tr><td colspan="6">Common settings: <code>char_wb</code>, n-grams (2, 4), <code>min_df=2</code>, <code>sublinear_tf=True</code>, float32, L2 rows; cut <code>sc &gt; 0.05</code> on every view; <code>max_cells=2e7</code> in <code>topk_sparse()</code>.</td></tr>
+    </tbody>
+  </table>
+
+  <figure>
+    <svg viewBox="0 0 800 400" width="100%" font-family="inherit" font-size="13" fill="#0f172a">
+      <defs>
+        <marker id="ch06-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="#334155"/>
+        </marker>
+      </defs>
+      <rect x="20" y="30" width="150" height="46" rx="6" fill="#f1f5f9" stroke="#334155"/>
+      <text x="95" y="49" text-anchor="middle">S1 (prep)</text>
+      <text x="95" y="66" text-anchor="middle">name_c addr_c postal</text>
+      <rect x="20" y="300" width="150" height="46" rx="6" fill="#f1f5f9" stroke="#334155"/>
+      <text x="95" y="319" text-anchor="middle">S2+S3 (prep)</text>
+      <text x="95" y="336" text-anchor="middle">name_c addr_c postal</text>
+      <rect x="200" y="150" width="120" height="76" rx="6" fill="#e2e8f0" stroke="#334155"/>
+      <text x="260" y="176" text-anchor="middle">groupby</text>
+      <text x="260" y="193" text-anchor="middle">country_n</text>
+      <text x="260" y="210" text-anchor="middle">open-set fallback</text>
+      <line x1="170" y1="53" x2="200" y2="170" stroke="#334155" stroke-width="1.5" marker-end="url(#ch06-arrow)"/>
+      <line x1="170" y1="323" x2="200" y2="206" stroke="#334155" stroke-width="1.5" marker-end="url(#ch06-arrow)"/>
+      <rect x="360" y="20" width="200" height="60" rx="6" fill="#dbeafe" stroke="#334155"/>
+      <text x="460" y="42" text-anchor="middle">name view: TF-IDF(name_c)</text>
+      <text x="460" y="62" text-anchor="middle">topk_sparse k=25</text>
+      <rect x="360" y="110" width="200" height="60" rx="6" fill="#dbeafe" stroke="#334155"/>
+      <text x="460" y="132" text-anchor="middle">full view: name_c | addr_c</text>
+      <text x="460" y="152" text-anchor="middle">topk_sparse k=25</text>
+      <rect x="360" y="200" width="200" height="60" rx="6" fill="#dbeafe" stroke="#334155"/>
+      <text x="460" y="222" text-anchor="middle">addr view: TF-IDF(addr_c)</text>
+      <text x="460" y="242" text-anchor="middle">topk_sparse k=10</text>
+      <rect x="360" y="290" width="200" height="60" rx="6" fill="#fef3c7" stroke="#334155"/>
+      <text x="460" y="312" text-anchor="middle">postal view: same postal</text>
+      <text x="460" y="332" text-anchor="middle">name cosine, k_postal=10</text>
+      <line x1="320" y1="170" x2="360" y2="50" stroke="#334155" stroke-width="1.5" marker-end="url(#ch06-arrow)"/>
+      <line x1="320" y1="180" x2="360" y2="140" stroke="#334155" stroke-width="1.5" marker-end="url(#ch06-arrow)"/>
+      <line x1="320" y1="195" x2="360" y2="230" stroke="#334155" stroke-width="1.5" marker-end="url(#ch06-arrow)"/>
+      <line x1="320" y1="210" x2="360" y2="320" stroke="#334155" stroke-width="1.5" marker-end="url(#ch06-arrow)"/>
+      <rect x="600" y="140" width="180" height="90" rx="6" fill="#cbd5e1" stroke="#334155"/>
+      <text x="690" y="165" text-anchor="middle">keep sc &gt; 0.05</text>
+      <text x="690" y="185" text-anchor="middle">vstack(chunks)</text>
+      <text x="690" y="205" text-anchor="middle">drop_duplicates(i1, i2)</text>
+      <line x1="560" y1="50" x2="600" y2="160" stroke="#334155" stroke-width="1.5" marker-end="url(#ch06-arrow)"/>
+      <line x1="560" y1="140" x2="600" y2="175" stroke="#334155" stroke-width="1.5" marker-end="url(#ch06-arrow)"/>
+      <line x1="560" y1="230" x2="600" y2="195" stroke="#334155" stroke-width="1.5" marker-end="url(#ch06-arrow)"/>
+      <line x1="560" y1="320" x2="600" y2="212" stroke="#334155" stroke-width="1.5" marker-end="url(#ch06-arrow)"/>
+      <rect x="600" y="280" width="180" height="90" rx="6" fill="#dcfce7" stroke="#334155"/>
+      <text x="690" y="304" text-anchor="middle">pair_cos() x3 views</text>
+      <text x="690" y="324" text-anchor="middle">cand: i1, i2, cos_name,</text>
+      <text x="690" y="344" text-anchor="middle">cos_full, cos_addr</text>
+      <line x1="690" y1="230" x2="690" y2="280" stroke="#334155" stroke-width="1.5" marker-end="url(#ch06-arrow)"/>
+    </svg>
+    <figcaption>Figure 6.1 — The four blocking views inside <code>block()</code>, run per country block, feed one cut-and-union step and then <code>pair_cos()</code>, which attaches the three cosines to every surviving pair.</figcaption>
+  </figure>
+
+  <h2>6.4 Partitioning by country and the open-set fallback</h2>
+  <p>The country label is the only field that permits an exact partition. <code>block()</code> iterates over <code>s1.groupby("country_n")</code>, where <code>country_n</code> is <code>basic(country)</code>, and restricts the S2/S3 index <code>i2</code> to rows with the identical normalised country. Partitioning makes a fixed k more valuable, since the top 25 within one country are likelier to contain the true partner than the top 25 across three, and it reduces the product cost to Σ<sub>c</sub> |S1<sub>c</sub>| × |S2S3<sub>c</sub>|.</p>
+  <p>The label is an open set, as the problem statement requires. <code>other_countries</code> is computed from the S2/S3 side; if an S1 group's label is absent from it, the group is compared against <em>all</em> S2/S3 rows rather than an empty block, so no S1 entity is silently dropped when its label is unseen, blank or misspelt on one side. France is unseen in training but present in the test set, so wherever the French label occurs on the S2/S3 side, French S1 records block within that block exactly as US and Indian records do; were the label present only on the S1 side, the fallback would compare those records against every S2/S3 row. Nothing in the code enumerates countries, and the same <code>block()</code> call is made for the training and the test split.</p>
+  <aside class="warn"><strong>Risk.</strong> If a blank label occurs on both sides, blank S1 records are compared with blank S2/S3 records only, which is too narrow if blanks are noise rather than a category. The per-country recall diagnostic of 6.8 exposes this; the remedy is to route the blank group through the all-records path.</aside>
+
+  <h2>6.5 Bounded top-k retrieval: <code>topk_sparse()</code></h2>
+  <p>Retrieving the k nearest S2/S3 rows for every S1 row of a view is a sparse product of the S1 matrix A with the transposed S2/S3 matrix B<sup>T</sup>, followed by a row-wise selection. To avoid materialising the full |A| × |B| product, <code>topk_sparse()</code> processes A in row chunks sized from |B|: <code>chunk = max(16, int(max_cells // n_b))</code> with <code>max_cells = 2e7</code>. The dense transient <code>S = (A[i:i+chunk] @ BT).toarray()</code> then holds about 2 × 10<sup>7</sup> float32 cells whatever the block size, until |B| exceeds 1.25 × 10<sup>6</sup> rows: from there the floor of 16 rows keeps the loop efficient at the price of a proportionally larger transient (Table 6.2). Before the loop, k is clipped to |B| and an empty A or B returns empty arrays of width 0, so a tiny country block cannot raise.</p>
+  <p>Selection uses <code>np.argpartition(S, S.shape[1] - k, axis=1)</code>: partitioning at kth = |B| − k places the k largest scores of each row in the last k positions, unordered, at linear expected cost, without a full sort or a negated copy of S. The slice <code>[:, -k:]</code> is followed by <code>.copy()</code>, and the copy matters: <code>argpartition</code> returns a full chunk × |B| int64 array, and a slice of it is a view that keeps the whole array alive; appending views to <code>idx_out</code> would retain every full-width array until the function returns, multiplying peak memory by the number of chunks. <code>np.take_along_axis</code> gathers the scores, and the stacked arrays are returned.</p>
+  <p>Because <code>argpartition</code> always returns exactly k columns, a row with fewer than k records sharing any n-gram is padded with arbitrary zero-score columns. The cut <code>keep = sc &gt; 0.05</code> removes this padding and near-zero neighbours. Each view's survivors are mapped to global indices (<code>np.repeat(i1, k)</code> for rows, <code>i2[idx]</code> for columns), stacked, and de-duplicated with <code>drop_duplicates()</code>, since a good pair is usually found by several views; an S1 record has at most 25 + 25 + 10 + 10 = 70 candidates before de-duplication.</p>
+
+  <figure>
+    <svg viewBox="0 0 800 420" width="100%" font-family="inherit" font-size="13" fill="#0f172a">
+      <defs>
+        <marker id="ch06-arrow2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="#334155"/>
+        </marker>
+      </defs>
+      <rect x="20" y="20" width="230" height="60" rx="6" fill="#f1f5f9" stroke="#334155"/>
+      <text x="135" y="44" text-anchor="middle">A: |A| x V sparse float32</text>
+      <text x="135" y="64" text-anchor="middle">BT = B.T.tocsr(): V x |B|</text>
+      <rect x="290" y="20" width="230" height="60" rx="6" fill="#e2e8f0" stroke="#334155"/>
+      <text x="405" y="44" text-anchor="middle">chunk = max(16, 2e7 // |B|)</text>
+      <text x="405" y="64" text-anchor="middle">|B| = 200,000 -&gt; chunk = 100</text>
+      <line x1="250" y1="50" x2="290" y2="50" stroke="#334155" stroke-width="1.5" marker-end="url(#ch06-arrow2)"/>
+      <rect x="20" y="110" width="760" height="230" rx="6" fill="#f1f5f9" stroke="#334155" stroke-dasharray="6 4"/>
+      <text x="40" y="132">for i in range(0, |A|, chunk):</text>
+      <rect x="40" y="150" width="200" height="70" rx="6" fill="#dbeafe" stroke="#334155"/>
+      <text x="140" y="174" text-anchor="middle">A[i:i+chunk] @ BT</text>
+      <text x="140" y="194" text-anchor="middle">.toarray() -&gt; S float32</text>
+      <text x="140" y="212" text-anchor="middle">chunk x |B|: 4 B/cell, 80 MB</text>
+      <rect x="290" y="150" width="220" height="70" rx="6" fill="#fee2e2" stroke="#334155"/>
+      <text x="400" y="174" text-anchor="middle">argpartition(S, |B|-k, axis=1)</text>
+      <text x="400" y="194" text-anchor="middle">int64 chunk x |B|</text>
+      <text x="400" y="212" text-anchor="middle">8 B/cell, 160 MB transient</text>
+      <rect x="560" y="150" width="200" height="70" rx="6" fill="#dcfce7" stroke="#334155"/>
+      <text x="660" y="174" text-anchor="middle">[:, -k:].copy()</text>
+      <text x="660" y="194" text-anchor="middle">part: chunk x k int64</text>
+      <text x="660" y="212" text-anchor="middle">100 x 25 x 8 B = 20 KB</text>
+      <line x1="240" y1="185" x2="290" y2="185" stroke="#334155" stroke-width="1.5" marker-end="url(#ch06-arrow2)"/>
+      <line x1="510" y1="185" x2="560" y2="185" stroke="#334155" stroke-width="1.5" marker-end="url(#ch06-arrow2)"/>
+      <rect x="290" y="250" width="220" height="70" rx="6" fill="#dcfce7" stroke="#334155"/>
+      <text x="400" y="274" text-anchor="middle">take_along_axis(S, part)</text>
+      <text x="400" y="294" text-anchor="middle">scores: chunk x k float32</text>
+      <text x="400" y="312" text-anchor="middle">idx_out.append, sc_out.append</text>
+      <line x1="660" y1="220" x2="660" y2="285" stroke="#334155" stroke-width="1.5"/>
+      <line x1="660" y1="285" x2="510" y2="285" stroke="#334155" stroke-width="1.5" marker-end="url(#ch06-arrow2)"/>
+      <line x1="140" y1="220" x2="140" y2="285" stroke="#334155" stroke-width="1.5"/>
+      <line x1="140" y1="285" x2="290" y2="285" stroke="#334155" stroke-width="1.5" marker-end="url(#ch06-arrow2)"/>
+      <text x="560" y="300">S and the full int64 array</text>
+      <text x="560" y="318">are freed at the next iteration</text>
+      <rect x="260" y="360" width="280" height="46" rx="6" fill="#cbd5e1" stroke="#334155"/>
+      <text x="400" y="380" text-anchor="middle">vstack(idx_out), vstack(sc_out)</text>
+      <text x="400" y="398" text-anchor="middle">|A| x k int64, |A| x k float32</text>
+      <line x1="400" y1="320" x2="400" y2="360" stroke="#334155" stroke-width="1.5" marker-end="url(#ch06-arrow2)"/>
+    </svg>
+    <figcaption>Figure 6.2 — The chunk loop of <code>topk_sparse()</code> with memory annotations for |B| = 200,000 and k = 25; the <code>.copy()</code> ensures that neither large transient survives the iteration.</figcaption>
+  </figure>
+
+  <h2>6.6 Memory budget and time complexity</h2>
+  <p>Three transients are allocated per chunk: the dense float32 scores at 4 bytes per cell, the int64 <code>argpartition</code> result at 8 bytes per cell, and the sparse product before <code>toarray()</code>, at 4 bytes of data plus 4 bytes of column index per non-zero. The sparse product is often close to dense (frequent bigrams occur in most records) and is budgeted at up to 8 bytes per cell. They are not all alive at once: the sparse product is released as soon as <code>toarray()</code> returns, before <code>argpartition</code> allocates, so the true peak is the larger of (sparse product + scores) and (scores + <code>argpartition</code>), and the sum of all three is a conservative bound. Table 6.2 works the budget through for three block sizes; the third row shows the 16-row floor.</p>
+
+  <table class="tbl">
+    <caption>Table 6.2 — Memory budget of one <code>topk_sparse()</code> chunk for three block sizes (k = 25, <code>max_cells = 2e7</code>, |A| = 100,000 S1 rows for the iteration count). Values follow from the formulas in 6.5 and 6.6; nothing here is measured.</caption>
+    <thead><tr><th>|B| (S2/S3 rows in block)</th><th>chunk rows</th><th>cells per chunk</th><th>scores S (float32)</th><th>argpartition (int64)</th><th>sparse product (≤ 8 B/nz)</th><th>peak transient (bound)</th><th>iterations</th></tr></thead>
+    <tbody>
+      <tr><td>20,000</td><td>1,000</td><td>2.0 × 10<sup>7</sup></td><td>80 MB</td><td>160 MB</td><td>≤ 160 MB</td><td>≈ 240 MB (≤ 400 MB)</td><td>100</td></tr>
+      <tr><td>200,000</td><td>100</td><td>2.0 × 10<sup>7</sup></td><td>80 MB</td><td>160 MB</td><td>≤ 160 MB</td><td>≈ 240 MB (≤ 400 MB)</td><td>1,000</td></tr>
+      <tr><td>2,000,000</td><td>16 (floor)</td><td>3.2 × 10<sup>7</sup></td><td>128 MB</td><td>256 MB</td><td>≤ 256 MB</td><td>≈ 384 MB (≤ 640 MB)</td><td>6,250</td></tr>
+      <tr><td colspan="8">Retained per view for |A| = 100,000, k = 25: indices 100,000 × 25 × 8 B = 20 MB, scores 10 MB. The postal view runs on far smaller B, so one chunk covers a whole group and its transients are negligible.</td></tr>
+    </tbody>
+  </table>
+
+  <p>Time is dominated by the sparse products. The cost of A<sub>c</sub> B<sub>c</sub><sup>T</sup> is the sum, over S1 rows and their n-grams, of each n-gram's posting-list length; with near-dense overlap it behaves like O(|A<sub>c</sub>| · |B<sub>c</sub>|) with a small constant, and <code>argpartition</code> adds another linear term per row. Over all views and countries the stage is O(Σ<sub>c</sub> |S1<sub>c</sub>| · |S2S3<sub>c</sub>|): the same order as brute force, but with a few floating-point operations per cell instead of several string alignments per pair. Chapter 12 places these terms in the end-to-end budget.</p>
+
+  <h2>6.7 Cosines for every surviving pair: <code>pair_cos()</code></h2>
+  <p>A pair retrieved only by the address view carries no name score from retrieval, yet the matcher needs all three cosines for every pair. <code>block()</code> therefore calls <code>pair_cos(A, B, i1, i2)</code> once per fuzzy view after the union. The function gathers <code>A[i1]</code> and <code>B[i2]</code> in slices of 200,000 pairs, multiplies them element-wise with the sparse <code>multiply()</code> and sums each row, which for L2-normalised rows is the cosine; slicing bounds memory regardless of the pair count. The resulting <code>cos_name</code>, <code>cos_full</code> and <code>cos_addr</code> are the first features of Chapter 7, and a uniformly computed <code>cos_full</code> is what makes the rank and gap features comparable.</p>
+
+  <h2>6.8 Diagnostics and how to act on them</h2>
+  <p>On the training split every candidate pair receives a label y = 1 if the S2/S3 id appears in the S1 entity's ground-truth list, and <code>main()</code> prints the quantities of Table 6.3. The count of <em>S1 entities with at least one true match blocked</em> is the number that matters for the macro metric: every matched entity outside it is capped at 0.0. The <em>blocking oracle</em> macro F<sub>0.5</sub>, obtained by predicting exactly the true blocked pairs, is the ceiling of the entire system; its gap to the out-of-fold score of Chapter 10 says whether effort belongs in blocking or in the matcher, and the <em>all-candidates floor</em> measures how much precision the matcher must add. The measured column is a placeholder until the pipeline has been run on the released data.</p>
+
+  <table class="tbl">
+    <caption>Table 6.3 — Blocking diagnostics printed by <code>block()</code> and <code>main()</code>, their interpretation, and the action each one triggers. Measured values: to be filled from the run log.</caption>
+    <thead><tr><th>Log line</th><th>Definition</th><th>Measured (train)</th><th>Action if unsatisfactory</th></tr></thead>
+    <tbody>
+      <tr><td>blocking: N pairs (x per S1)</td><td>|cand| and |cand| / |S1|, printed by <code>block()</code>; the reduction ratio 1 − |cand| / (|S1| · |S2+S3|) is derived from it by hand, not printed</td><td>to be filled from the run log</td><td>far above ~50 per S1: lower <code>k_addr</code> or raise the 0.05 cut; far below: check that the country partition is not empty</td></tr>
+      <tr><td>blocking recall ceiling</td><td>Σ y / total ground-truth pairs</td><td>to be filled from the run log</td><td>raise <code>k_name</code> / <code>k_full</code>; add a view (e.g. word tokens or house-number key)</td></tr>
+      <tr><td>S1 entities with ≥ 1 true match blocked</td><td>distinct <code>i1</code> with y = 1 over S1 entities with non-empty truth</td><td>to be filled from the run log</td><td>same as above; this is the macro-relevant recall</td></tr>
+      <tr><td>blocking recall by country</td><td>Σ y / true pairs, grouped by S1 <code>country_n</code></td><td>to be filled from the run log</td><td>one country low: extend <code>ADDR_ABBR</code> / <code>ADDR_STOP</code> for its idioms (see Chapter 5), or raise k for that block</td></tr>
+      <tr><td>blocking recall by source</td><td>Σ y / true pairs, grouped by S2 / S3 prefix</td><td>to be filled from the run log</td><td>S3 low: its fields are noisier; raise <code>k_addr</code> or <code>k_postal</code></td></tr>
+      <tr><td>macro F0.5 if every candidate were predicted (floor)</td><td>score of the identity matcher on the candidate lists</td><td>to be filled from the run log</td><td>informational: the gap to the oracle is the matcher's job</td></tr>
+      <tr><td>blocking oracle macro F0.5 (ceiling)</td><td>score of a perfect matcher on blocked pairs</td><td>to be filled from the run log</td><td>if close to the OOF score, invest in blocking; otherwise in the matcher</td></tr>
+    </tbody>
+  </table>
+
+  <aside class="note"><strong>Design note.</strong> Every k in Table 6.1 is a keyword argument of <code>block()</code>, so raising a view's depth is a one-token change, and adding a view is one entry in the <code>fields</code> dictionary, over which every loop of the stage iterates; the new <code>cos_*</code> column enters the feature list automatically.</aside>
+</section>

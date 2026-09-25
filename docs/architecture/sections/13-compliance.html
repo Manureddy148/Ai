@@ -1,0 +1,125 @@
+<section class="chapter" id="ch-13">
+  <h1><span class="num">13</span> Fair Play, Licensing and Constraint Compliance</h1>
+  <p class="lead">The problem statement attaches five hard constraints and a fair-play rule to every submission, and the top packages are reviewed before rankings are confirmed. This chapter is written for that review: it maps each rule to the construct in <code>er_pipeline.py</code> that satisfies it, inventories every file-system and network touch, lists dependency licences, bounds the parameter count, and shows how <code>candidate_pairs.tsv</code> makes blocking auditable.</p>
+
+  <h2>13.1 Compliance matrix</h2>
+  <p>Table 13.1 states the conclusion; the remaining sections supply the evidence. Every hard constraint is met by construction; the two recommendations concern the strength of the reproducibility claim, not eligibility.</p>
+  <table class="tbl">
+    <caption>Table 13.1 — Constraint-to-evidence compliance matrix</caption>
+    <thead><tr><th>Constraint</th><th>Evidence in code</th><th>Status</th></tr></thead>
+    <tbody>
+      <tr><td>No external data lookup (fair play)</td><td>Only <code>read_tsv()</code> reads of the seven provided TSVs; no network-capable imports (Section 13.2)</td><td>Compliant</td></tr>
+      <tr><td>No network activity at run time</td><td>One conditional <code>os.system(pip install rapidfuzz)</code>, software only, skipped when the package is installed</td><td>Compliant; remove fallback and pre-install (Section 13.2.2)</td></tr>
+      <tr><td>No use of test labels</td><td><code>load_split()</code> returns <code>gt = None</code> for test; <code>thr</code>, <code>ratio</code> and rounds come from <code>GroupKFold</code> OOF</td><td>Compliant</td></tr>
+      <tr><td>Model licence MIT / Apache-2.0</td><td>LightGBM (MIT) booster trained in-run; no pretrained weights (Table 13.2)</td><td>Compliant</td></tr>
+      <tr><td>Model ≤ 8B parameters</td><td>≤ 2,200 trees × 63 leaves, about 4 × 10<sup>5</sup> numbers (Section 13.3.2)</td><td>Compliant</td></tr>
+      <tr><td>Exactly one row per test S1 entity</td><td><code>to_lists()</code> keyed on <code>s1.entity_id</code>; writer iterates <code>te1.entity_id.values</code></td><td>Compliant</td></tr>
+      <tr><td>Empty list for singletons</td><td>Empty list joins to <code>""</code>; row is <code>id\t\n</code></td><td>Compliant</td></tr>
+      <tr><td>No duplicate ids within a list</td><td><code>drop_duplicates()</code> in <code>block()</code> and <code>decode_table()</code>; <code>dict.fromkeys()</code> in writer</td><td>Compliant</td></tr>
+      <tr><td>S2-/S3- ids only, present in the test set</td><td><code>i2</code> indexes <code>pd.concat([s2, s3])</code> loaded from the test files; S1 self-matches impossible</td><td>Compliant</td></tr>
+      <tr><td>Matches ⊆ candidates; candidates = inference set</td><td><code>decide()</code> and <code>cands</code> both derive from <code>fte</code>; <code>model.predict(fte[feats])</code></td><td>Compliant</td></tr>
+      <tr><td>Exact header, tab-separated, no quoting</td><td>Literal <code>f"source1_entity_id\t{col}\n"</code>; ids loaded with <code>quoting=3</code></td><td>Compliant; checked by <code>validate_submission.py</code></td></tr>
+      <tr><td>Country as an open set; France included</td><td><code>groupby("country_n")</code> with all-records fallback; no country feature (Section 13.5)</td><td>Compliant</td></tr>
+      <tr><td>Package layout (output/, code/…/src, README, requirements, methodology)</td><td>Single script under <code>src/</code>, <code>requirements.txt</code>, README run steps (see Chapter 11)</td><td>Compliant</td></tr>
+      <tr><td>Bit-exact reproducibility</td><td>Row and column subsampling in <code>params</code> with no explicit <code>seed</code> or <code>deterministic</code> key and <code>n_jobs=-1</code>; lower-bound-only pins in <code>requirements.txt</code></td><td>Partial; set <code>seed</code> and <code>deterministic=True</code>, pin exact versions (see Chapter 11)</td></tr>
+    </tbody>
+  </table>
+
+  <h2>13.2 No external lookup</h2>
+  <h3>13.2.1 What the script can open</h3>
+  <p>The fair-play rule forbids external databases, APIs, geocoders and internet-sourced augmentation. The strongest evidence of compliance is an exhaustive list of the process's input and output channels. The imports are seven standard-library modules and five third-party packages (NumPy, pandas, scikit-learn, rapidfuzz, LightGBM); none is a network client, and no <code>socket</code>, <code>urllib</code>, <code>requests</code> or cloud SDK appears in the file. Figure 13.1 draws the boundary; the touches are:</p>
+  <dl>
+    <dt><code>find_data_dir()</code></dt><dd><code>glob()</code> for <code>train_source1.tsv</code> under <code>/kaggle/input</code>, <code>.</code>, <code>..</code> and <code>dataset</code>: local metadata only.</dd>
+    <dt><code>load_split()</code></dt><dd>Three <code>read_tsv()</code> calls per split plus an <code>os.path.exists()</code>-guarded read of the ground truth; on the test split the guard fails and <code>gt = None</code>.</dd>
+    <dt><code>main()</code></dt><dd><code>os.makedirs()</code> and two <code>open(path, "w")</code> calls for the output files (see Chapter 11).</dd>
+    <dt>module import</dt><dd><code>os.system(pip install -q rapidfuzz)</code>, only when the import raises <code>ImportError</code> (Section 13.2.2).</dd>
+  </dl>
+  <p>The vectorisers in <code>block()</code> are fitted on the texts of the split being processed, on the test split the provided test records: transductive use of the challenge's own unlabelled inputs, which lets French character n-grams be learned without a French resource (see Chapter 6).</p>
+  <figure>
+    <svg viewBox="0 0 800 330" width="100%" xmlns="http://www.w3.org/2000/svg" font-family="inherit" font-size="13">
+      <defs>
+        <marker id="ch13-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="#334155"/>
+        </marker>
+      </defs>
+      <rect x="10" y="40" width="200" height="250" rx="6" fill="#f1f5f9" stroke="#334155"/>
+      <text x="110" y="62" text-anchor="middle" fill="#0f172a" font-weight="bold">data dir (local)</text>
+      <rect x="25" y="75" width="170" height="26" rx="6" fill="#dbeafe" stroke="#334155"/>
+      <text x="110" y="93" text-anchor="middle" fill="#0f172a">train_source1/2/3.tsv</text>
+      <rect x="25" y="108" width="170" height="26" rx="6" fill="#dbeafe" stroke="#334155"/>
+      <text x="110" y="126" text-anchor="middle" fill="#0f172a">train_ground_truth.tsv</text>
+      <rect x="25" y="160" width="170" height="26" rx="6" fill="#bfdbfe" stroke="#334155"/>
+      <text x="110" y="178" text-anchor="middle" fill="#0f172a">test_source1/2/3.tsv</text>
+      <text x="110" y="215" text-anchor="middle" fill="#0f172a">no test labels:</text>
+      <text x="110" y="233" text-anchor="middle" fill="#0f172a">gt = None</text>
+      <text x="110" y="270" text-anchor="middle" fill="#0f172a">read_tsv() only</text>
+
+      <rect x="290" y="40" width="230" height="250" rx="6" fill="#e2e8f0" stroke="#334155"/>
+      <text x="405" y="62" text-anchor="middle" fill="#0f172a" font-weight="bold">er_pipeline.py process</text>
+      <rect x="305" y="78" width="200" height="26" rx="6" fill="#f1f5f9" stroke="#334155"/>
+      <text x="405" y="96" text-anchor="middle" fill="#0f172a">find_data_dir() / load_split()</text>
+      <rect x="305" y="112" width="200" height="26" rx="6" fill="#f1f5f9" stroke="#334155"/>
+      <text x="405" y="130" text-anchor="middle" fill="#0f172a">prep() → block() → features()</text>
+      <rect x="305" y="146" width="200" height="26" rx="6" fill="#f1f5f9" stroke="#334155"/>
+      <text x="405" y="164" text-anchor="middle" fill="#0f172a">lgb.train() / decide()</text>
+      <rect x="305" y="180" width="200" height="26" rx="6" fill="#f1f5f9" stroke="#334155"/>
+      <text x="405" y="198" text-anchor="middle" fill="#0f172a">main() writer loop</text>
+      <text x="405" y="240" text-anchor="middle" fill="#0f172a">no socket / urllib /</text>
+      <text x="405" y="258" text-anchor="middle" fill="#0f172a">requests imports</text>
+
+      <rect x="600" y="40" width="190" height="130" rx="6" fill="#dcfce7" stroke="#334155"/>
+      <text x="695" y="62" text-anchor="middle" fill="#0f172a" font-weight="bold">output/ (local)</text>
+      <rect x="612" y="78" width="166" height="26" rx="6" fill="#f1f5f9" stroke="#334155"/>
+      <text x="695" y="96" text-anchor="middle" fill="#0f172a">matching_results.tsv</text>
+      <rect x="612" y="112" width="166" height="26" rx="6" fill="#f1f5f9" stroke="#334155"/>
+      <text x="695" y="130" text-anchor="middle" fill="#0f172a">candidate_pairs.tsv</text>
+
+      <rect x="600" y="200" width="190" height="90" rx="6" fill="#fee2e2" stroke="#334155" stroke-dasharray="6 4"/>
+      <text x="695" y="222" text-anchor="middle" fill="#0f172a" font-weight="bold">package index (network)</text>
+      <text x="695" y="246" text-anchor="middle" fill="#0f172a">pip install rapidfuzz</text>
+      <text x="695" y="264" text-anchor="middle" fill="#0f172a">only on ImportError</text>
+      <text x="695" y="282" text-anchor="middle" fill="#0f172a">code, never data</text>
+
+      <line x1="210" y1="90" x2="290" y2="90" stroke="#334155" stroke-width="1.5" marker-end="url(#ch13-arrow)"/>
+      <line x1="210" y1="173" x2="290" y2="173" stroke="#334155" stroke-width="1.5" marker-end="url(#ch13-arrow)"/>
+      <line x1="520" y1="193" x2="600" y2="105" stroke="#334155" stroke-width="1.5" marker-end="url(#ch13-arrow)"/>
+      <line x1="600" y1="245" x2="520" y2="245" stroke="#334155" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#ch13-arrow)"/>
+      <text x="560" y="238" text-anchor="middle" fill="#0f172a">fallback</text>
+    </svg>
+    <figcaption>Figure 13.1 — The complete I/O boundary of the pipeline: seven local TSV reads, two local TSV writes, and one conditional network action that fetches software, not data.</figcaption>
+  </figure>
+
+  <h3>13.2.2 The rapidfuzz install fallback</h3>
+  <p>The one statement that can reach the network sits in the import block: if importing <code>fuzz</code> and <code>JaroWinkler</code> from rapidfuzz raises <code>ImportError</code>, the script runs <code>os.system(f"{sys.executable} -m pip install -q rapidfuzz")</code> and retries both imports. This is compatible with the fair-play rule, which targets lookups of business identities and address-normalisation services: installing an MIT-licensed string-similarity library fetches no record, gazetteer or model weights, and no input data leaves the process. It is nonetheless the one line a reviewer scanning for network activity will stop at.</p>
+  <aside class="warn"><strong>Risk.</strong> The <code>pip install</code> fallback is unpinned and environment-dependent. Offline, it fails silently inside <code>os.system()</code>, the second import raises <code>ImportError</code>, and the run aborts before reading any data. Online, it may resolve a rapidfuzz release newer than the one behind the submitted outputs, shifting the similarity scores at the last decimal and, through the tuned threshold, a few near-boundary decisions. Neither breaks a rule, but both weaken the "anyone can regenerate both output files" promise. The remedy is to pin rapidfuzz to an exact version in <code>requirements.txt</code>, install it before the run as the README instructs, and delete the <code>except ImportError</code> branch so a missing dependency fails loudly. On Kaggle the package is pre-installed and the branch never executes.</aside>
+
+  <h2>13.3 Licence and model-size constraints</h2>
+  <h3>13.3.1 Licence inventory</h3>
+  <p>Constraint 5 requires an MIT- or Apache-2.0-licensed model of at most 8 billion parameters. The final model is a LightGBM booster trained from scratch on the provided training pairs; no pretrained weights, embeddings or language models are loaded, so the only licence attached to the model is that of the software that produced it. Table 13.2 lists every dependency in <code>requirements.txt</code>; the BSD-3-Clause packages are tooling rather than models, and BSD-3-Clause is at least as permissive as the two licences the rule names.</p>
+  <table class="tbl">
+    <caption>Table 13.2 — Licence inventory of the runtime dependencies</caption>
+    <thead><tr><th>Package</th><th>Role in the pipeline</th><th>Licence</th><th>Carries model weights?</th></tr></thead>
+    <tbody>
+      <tr><td>LightGBM (<code>lightgbm&gt;=4.0</code>)</td><td>Gradient-boosted matcher, <code>lgb.train()</code></td><td>MIT</td><td>No; trained in-run</td></tr>
+      <tr><td>rapidfuzz (<code>rapidfuzz&gt;=3.0</code>)</td><td><code>fuzz</code> ratios and <code>JaroWinkler</code> in <code>features()</code></td><td>MIT</td><td>No</td></tr>
+      <tr><td>scikit-learn (<code>scikit-learn&gt;=1.3</code>)</td><td><code>TfidfVectorizer</code>, <code>GroupKFold</code></td><td>BSD-3-Clause</td><td>No; vectorisers fitted in-run</td></tr>
+      <tr><td>NumPy (<code>numpy&gt;=1.24</code>)</td><td>Arrays, <code>argpartition</code> in <code>topk_sparse()</code></td><td>BSD-3-Clause</td><td>No</td></tr>
+      <tr><td>SciPy (<code>scipy&gt;=1.10</code>)</td><td>Sparse matrices behind TF-IDF (not imported directly; a scikit-learn dependency)</td><td>BSD-3-Clause</td><td>No</td></tr>
+      <tr><td>pandas (<code>pandas&gt;=2.0</code>)</td><td>Frames, <code>read_csv</code>, groupby context features</td><td>BSD-3-Clause</td><td>No</td></tr>
+      <tr><td>Python standard library</td><td><code>re</code>, <code>unicodedata</code>, <code>glob</code>, …</td><td>PSF</td><td>No</td></tr>
+    </tbody>
+  </table>
+
+  <h3>13.3.2 Parameter count</h3>
+  <p>The size bound follows from <code>params</code> and the training loop alone. Each fold trains up to 2,000 rounds with <code>lgb.early_stopping(100)</code>, <code>iters</code> collects each fold's <code>best_iteration</code>, and the final refit in <code>main()</code> uses <code>int(np.mean(iters) * 1.1)</code> rounds, so even if every fold ran to the cap the deployed forest holds at most 2,200 trees. With <code>num_leaves=63</code>, a binary tree stores 62 internal nodes (a feature index and a threshold each) and 63 leaf values, about 187 numbers, so the worst case is roughly 2,200 × 187 ≈ 4.1 × 10<sup>5</sup> numbers, a factor of about 2 × 10<sup>4</sup> below the 8 × 10<sup>9</sup> ceiling. The actual tree count is a run-time quantity and is recorded in the placeholder table of Chapter 11 rather than estimated here. The three TF-IDF vocabularies are preprocessing artefacts, not model parameters, bounded by the distinct 2–4-character n-grams with <code>min_df=2</code> in the provided texts. The 38 input columns of <code>feats</code> (every column of the feature frame except <code>i1</code>, <code>i2</code> and <code>y</code>) are listed in Chapter 7.</p>
+
+  <h2>13.4 Output-format constraints by construction</h2>
+  <p>Constraints 1 to 4 concern the two TSV files, and each is satisfied by a specific construct. <code>to_lists()</code> starts from <code>{e: [] for e in s1.entity_id}</code>, so every test S1 entity owns a row before any pair is appended, and the writer iterates <code>te1.entity_id.values</code> once; missing and duplicate rows are both impossible. Self-matches are excluded because <code>load_split()</code> returns <code>pd.concat([s2, s3])</code> as the only "other" frame, <code>block()</code> draws <code>i2</code> from it alone, and <code>to_lists()</code> maps <code>i2</code> through <code>other.entity_id.values</code>. Unknown ids are excluded because every emitted id string was loaded by <code>read_tsv()</code> from the test S2/S3 files with <code>dtype=str</code> and <code>quoting=3</code>. Duplicates within a list are removed at up to three points: <code>drop_duplicates()</code> on the <code>(i1, i2)</code> table in <code>block()</code>, which already makes <code>candidate_pairs.tsv</code> duplicate-free; <code>drop_duplicates("i2")</code> in <code>decode_table()</code>, which additionally assigns each S2/S3 record to a single S1 entity in <code>matching_results.tsv</code>; and <code>dict.fromkeys()</code> in the writer, an order-preserving safety net for both files. Matches are a subset of candidates, and <code>candidate_pairs.tsv</code> is the exact inference set, because <code>decide()</code>, <code>cands</code> and <code>model.predict(fte[feats])</code> all operate on the same <code>fte</code> frame. The stdlib validator of Chapter 10 re-checks all of this from the files alone.</p>
+
+  <h2>13.5 Country as an open set</h2>
+  <p>The problem statement forbids hard-coding, filtering or one-hot encoding the pipeline to {US, India}. The country label enters the code at two points: <code>prep()</code> normalises it through <code>basic()</code> into <code>country_n</code>, a free string, and <code>block()</code> partitions the S1 frame by <code>groupby("country_n")</code>, whatever values occur, comparing a group whose label has no S2/S3 counterpart (or a blank label) against every S2/S3 record instead of an empty block; the <code>continue</code> that guards this loop fires only when the whole S2/S3 frame is empty. Country is not a model feature: <code>features()</code> emits no country column and no column derived from one, so the booster cannot learn a US- or India-specific branch; the only source indicator is <code>is_s3</code>, taken from the entity-id prefix. French legal forms and address idioms sit in <code>NAME_ABBR</code> (<code>cie</code>, <code>ste</code>), <code>LEGAL</code> (<code>sarl</code>, <code>sas</code>, <code>eurl</code>, …), <code>ADDR_ABBR</code> (<code>fbg</code>, <code>chem</code>, <code>imp</code>) and <code>ADDR_STOP</code> (<code>de</code>, <code>la</code>, <code>des</code>, …) as generic normalisation entries applied to every record, not as a country branch, so a French test entity takes the same path as a US one and is written to both files.</p>
+  <aside class="note"><strong>Design note.</strong> <code>best_thr</code> and <code>best_ratio</code> are tuned on US and Indian out-of-fold predictions, the only labelled entities. Under a precision-weighted F<sub>0.5</sub> with all-or-nothing singleton credit, an operating point too permissive for France costs more than one too strict; the per-country match-rate line logged at the end of <code>main()</code> checks that France is neither starved nor over-matched (see Chapter 14).</aside>
+
+  <h2>13.6 Auditability of blocking</h2>
+  <p>The organisers use <code>candidate_pairs.tsv</code> to measure the recall ceiling and reduction ratio of blocking and to verify the pipeline. The file supports that audit directly: it is the full <code>fte[["i1", "i2"]]</code> table converted to id lists, with no filtering between it and <code>model.predict()</code>, so the reduction ratio 1 − |pairs| / (|S1| · |S2 + S3|) can be computed from the file and the test sources alone. On the training split the same <code>block()</code> call is scored against the labels and logged: the pair-level recall ceiling, the count of S1 entities with at least one true match blocked (the quantity the macro metric actually depends on), recall by country and by source, the all-candidates floor and the blocking-oracle ceiling. A reviewer can therefore confirm that the submitted candidate set came from a stage whose behaviour was measured on labelled data, not tuned on hidden information; the values themselves are to be filled from the run log (Chapter 11). The remaining sources of run-to-run variation, unseeded bagging and dependency drift, are catalogued in Chapter 11 and carried into the risk register of Chapter 14.</p>
+</section>

@@ -1,0 +1,169 @@
+<section class="chapter" id="ch-07">
+  <h1><span class="num">7</span> Pair Feature Engineering</h1>
+  <p class="lead">This chapter describes <code>features()</code>, which turns every candidate pair from blocking (Chapter 6) into the 38-column numeric row scored by the LightGBM matcher of Chapter 8. The features fall into three groups: pairwise similarities of the normalised name and address, agreement states of the structured address components, and context features that place a pair among the competing candidates of the same Source 1 and Source 2/3 record. Each similarity absorbs one noise class from Chapter 3; the context features let a per-pair classifier approximate the per-entity decision that precision-weighted F<sub>0.5</sub> rewards.</p>
+
+  <h2>7.1 Role of the feature layer</h2>
+  <p><code>features(cand, s1, other)</code> receives the candidate table (<code>i1</code>, <code>i2</code>, the three cosines) and the prepared frames of Chapter 5, and aligns the left record <code>L = s1.loc[cand.i1]</code> with the right record <code>R = other.loc[cand.i2]</code> row by row, so every column below is a function of one (L, R) pair. <code>main()</code> takes every column except <code>i1</code>, <code>i2</code> and the label <code>y</code> as model input, so Table 7.1 is the complete feature list. No feature reads the country label, the raw text or the ground truth. Because F<sub>0.5</sub> weights precision twice as heavily as recall and a singleton scores 1.0 only with an empty list (Chapter 2), the layer supplies evidence <em>against</em> a match (conflicting numbers, a dominating competitor) as deliberately as evidence for one.</p>
+
+  <table class="tbl">
+    <caption>Table 7.1 — Complete feature catalogue of features(); L is the Source 1 record, R the Source 2/3 record</caption>
+    <thead><tr><th>Feature</th><th>Definition</th><th>Range</th><th>Noise addressed / role</th></tr></thead>
+    <tbody>
+      <tr><td><code>cos_name</code></td><td>TF-IDF <code>char_wb</code> 2-4-gram cosine of <code>name_c</code> (from <code>block()</code>)</td><td>0-1</td><td>Typos, abbreviations, reordering in the core name</td></tr>
+      <tr><td><code>cos_full</code></td><td>Cosine of <code>name_c + " | " + addr_c</code></td><td>0-1</td><td>Joint name and address evidence; basis of rank and gap features</td></tr>
+      <tr><td><code>cos_addr</code></td><td>Cosine of <code>addr_c</code></td><td>0-1</td><td>Address rewriting, abbreviations</td></tr>
+      <tr><td><code>n_ratio</code></td><td><code>fuzz.ratio(L.name_c, R.name_c)</code></td><td>0-100</td><td>Character typos; order-sensitive baseline</td></tr>
+      <tr><td><code>n_tsort</code></td><td><code>fuzz.token_sort_ratio</code> on <code>name_c</code></td><td>0-100</td><td>Token reordering</td></tr>
+      <tr><td><code>n_tset</code></td><td><code>fuzz.token_set_ratio</code> on <code>name_c</code></td><td>0-100</td><td>Extra tokens on one side (trade names, descriptors)</td></tr>
+      <tr><td><code>n_partial</code></td><td><code>fuzz.partial_ratio</code> on <code>name_c</code></td><td>0-100</td><td>Truncation, one name embedded in the other</td></tr>
+      <tr><td><code>n_jw</code></td><td><code>JaroWinkler.similarity</code> on <code>name_c</code></td><td>0-1</td><td>Interior typos with intact prefix</td></tr>
+      <tr><td><code>n_full_ratio</code></td><td><code>fuzz.ratio(L.name_n, R.name_n)</code> (legal suffixes kept)</td><td>0-100</td><td>Legal-form agreement between records with equal core names</td></tr>
+      <tr><td><code>n_jacc</code></td><td><code>jacc()</code>: Jaccard of core-name token sets</td><td>0-1</td><td>Whole-token overlap independent of spelling</td></tr>
+      <tr><td><code>n_first_eq</code></td><td>1 if first tokens of <code>name_c</code> are equal</td><td>{0,1}</td><td>Brand token agreement</td></tr>
+      <tr><td><code>n_init_eq</code></td><td>1 if the strings of token initials are equal</td><td>{0,1}</td><td>Same initials pattern; strong for multi-token names</td></tr>
+      <tr><td><code>n_alias_best</code></td><td>max <code>token_sort_ratio</code> over all pairs of <code>name_alts</code> variants</td><td>0-100</td><td>Legal name on one side, DBA / trade name on the other</td></tr>
+      <tr><td><code>has_alias</code></td><td>1 if either record has more than one name variant</td><td>{0,1}</td><td>Marks pairs where <code>n_alias_best</code> is informative</td></tr>
+      <tr><td><code>n_acronym</code></td><td>1 if one core name is a single token equal to the initials of the other multi-token core name</td><td>{0,1}</td><td>Acronym vs expansion (sbi / state bank india)</td></tr>
+      <tr><td><code>a_ratio</code></td><td><code>fuzz.ratio</code> on <code>addr_c</code></td><td>0-100</td><td>Address typos</td></tr>
+      <tr><td><code>a_tset</code></td><td><code>fuzz.token_set_ratio</code> on <code>addr_c</code></td><td>0-100</td><td>Partial addresses, extra locality tokens</td></tr>
+      <tr><td><code>a_partial</code></td><td><code>fuzz.partial_ratio</code> on <code>addr_c</code></td><td>0-100</td><td>Truncated addresses</td></tr>
+      <tr><td><code>a_jacc</code></td><td>Jaccard of address token sets</td><td>0-1</td><td>Whole-token overlap of addresses</td></tr>
+      <tr><td><code>postal_state</code></td><td>0 if either <code>postal</code> empty; 1 equal; -1 different</td><td>{-1,0,1}</td><td>Missing vs conflicting postal codes</td></tr>
+      <tr><td><code>num_overlap</code></td><td>Jaccard of <code>nums</code> digit-run sets; -1 if either empty</td><td>-1 or 0-1</td><td>Street / plot / floor number agreement</td></tr>
+      <tr><td><code>num_conflict</code></td><td>1 if both <code>nums</code> non-empty and disjoint</td><td>{0,1}</td><td>Explicit evidence against a match</td></tr>
+      <tr><td><code>house_state</code></td><td>0 if either <code>house</code> empty; 1 equal; -1 different</td><td>{-1,0,1}</td><td>Leading (house) number agreement</td></tr>
+      <tr><td><code>len_l</code>, <code>len_r</code></td><td>Character length of <code>name_c</code> on each side</td><td>integer</td><td>Calibrates similarity scores by string length</td></tr>
+      <tr><td><code>alen_l</code>, <code>alen_r</code></td><td>Character length of <code>addr_c</code> on each side</td><td>integer</td><td>Detects empty or stub addresses</td></tr>
+      <tr><td><code>is_s3</code></td><td>1 if <code>R.src == "S3"</code></td><td>{0,1}</td><td>Source-specific field quality</td></tr>
+      <tr><td><code>cos_full_gap1</code>, <code>n_tset_gap1</code>, <code>a_tset_gap1</code></td><td>Value minus the maximum of that column over the same <code>i1</code></td><td>&le; 0</td><td>Is this the best candidate of the S1 record</td></tr>
+      <tr><td><code>cos_full_gap2</code>, <code>n_tset_gap2</code>, <code>a_tset_gap2</code></td><td>Value minus the maximum over the same <code>i2</code></td><td>&le; 0</td><td>Is this S1 the best owner of the S2/S3 record</td></tr>
+      <tr><td><code>rank1</code></td><td>Rank of <code>cos_full</code> within the same <code>i1</code>, 1 = best, ties by table order</td><td>1..n_cand1</td><td>Position among the S1 record's candidates</td></tr>
+      <tr><td><code>rank2</code></td><td>Rank of <code>cos_full</code> within the same <code>i2</code></td><td>1..n_cand2</td><td>Position among the S2/S3 record's candidates</td></tr>
+      <tr><td><code>n_cand1</code></td><td>Number of candidates of the S1 record</td><td>&ge; 1</td><td>Crowding: common names, chains</td></tr>
+      <tr><td><code>n_cand2</code></td><td>Number of S1 records competing for the S2/S3 record</td><td>&ge; 1</td><td>Crowding on the other side</td></tr>
+    </tbody>
+  </table>
+
+  <h2>7.2 TF-IDF cosines</h2>
+  <p>The three cosines are not recomputed by <code>features()</code>; <code>block()</code> attaches them through <code>pair_cos()</code> for every surviving pair, whichever view retrieved it. Each view has its own <code>TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 4), min_df=2, sublinear_tf=True)</code> fitted on the union of both sides, so a cosine is corpus-weighted (the inverse document frequency of the n-grams of "road" or "nagar" is low), which complements the rapidfuzz scorers that weight every character equally. <code>cos_full</code> is the basis of the rank and gap features of 7.7 because it is the only score combining name and address evidence for every pair.</p>
+
+  <h2>7.3 rapidfuzz name similarities</h2>
+  <h3>7.3.1 What each scorer computes</h3>
+  <p>All five scorers run on the core name <code>name_c</code> (Chapter 5). <code>fuzz.ratio</code> is the normalised Indel similarity: with LCS the length of the longest common subsequence, ratio = 200·LCS / (|a| + |b|). It is order-sensitive and treats every character alike; each other scorer relaxes it in one direction.</p>
+  <p><code>fuzz.token_sort_ratio</code> sorts the whitespace tokens of both strings, re-joins them and applies <code>ratio</code>, so any permutation of the same tokens scores 100: it absorbs reordering and nothing else. <code>fuzz.token_set_ratio</code> forms the sorted intersection t<sub>0</sub> of the token sets and the strings t<sub>0</sub> + (tokens only in a) and t<sub>0</sub> + (tokens only in b), and returns the best <code>ratio</code> among the three pairings; when one token set is a subset of the other the score is 100, so extra tokens on one side are ignored wherever they occur. <code>fuzz.partial_ratio</code> returns the best <code>ratio</code> of the shorter string against any window of its own length in the longer one; it absorbs truncation but not interleaved extra tokens. <code>JaroWinkler.similarity</code> counts characters that match within a window of ⌊max(|a|,|b|)/2⌋ − 1 positions, penalises transpositions and adds a prefix bonus of up to four characters with weight 0.1, J<sub>W</sub> = J + ℓ·0.1·(1 − J); it stays high for an interior typo when the first characters agree and drops fast when they differ.</p>
+  <p>All five are kept because their disagreement pattern is itself a signal: <code>n_tset</code> = 100 with <code>n_ratio</code> = 55 is a subset relation, 100 with 100 an exact match. <code>n_full_ratio</code> applies <code>fuzz.ratio</code> to the full name <code>name_n</code>, the only feature that still sees the legal form; it separates records whose core names coincide but whose legal forms differ, often the line between a match and a costly false positive.</p>
+
+  <h3>7.3.2 Worked comparison</h3>
+  <table class="tbl">
+    <caption>Table 7.2 — rapidfuzz scorers on four example core-name pairs; values are computed by hand from the scorer definitions and are approximate to within about two points</caption>
+    <thead><tr><th>Pair (name_c L / R)</th><th>Noise</th><th>n_ratio</th><th>n_tsort</th><th>n_tset</th><th>n_partial</th><th>n_jw</th><th>n_jacc</th></tr></thead>
+    <tbody>
+      <tr><td>acme pizza / pizza acme</td><td>Token reorder</td><td>50</td><td>100</td><td>100</td><td>67</td><td>0.52</td><td>1.00</td></tr>
+      <tr><td>bharat petroleum / bharat oil petroleum depot</td><td>Interleaved extra tokens</td><td>76</td><td>76</td><td>100</td><td>75</td><td>0.89</td><td>0.50</td></tr>
+      <tr><td>mahindra logistics / mahindra logistics supply chain solutions</td><td>Truncation</td><td>61</td><td>61</td><td>100</td><td>100</td><td>0.89</td><td>0.40</td></tr>
+      <tr><td>reliance retail / relaince retail</td><td>Interior transposition</td><td>93</td><td>93</td><td>93</td><td>93</td><td>0.98</td><td>0.33</td></tr>
+    </tbody>
+  </table>
+  <p>The rows show the division of labour. Reordering is invisible to <code>n_tsort</code> and <code>n_tset</code> but heavily penalised by <code>n_ratio</code> and <code>n_jw</code>. Interleaved extra tokens are absorbed only by <code>n_tset</code>; <code>n_partial</code> finds no contiguous window. Truncation is absorbed by both. An interior transposition leaves every scorer above 90 but is best absorbed by Jaro-Winkler through its prefix bonus, while <code>n_jacc</code> drops to 0.33 (one shared token out of three distinct ones), which is why whole-token overlap must be complemented by character-level scorers.</p>
+
+  <h3>7.3.3 Token-level agreement</h3>
+  <p><code>n_jacc</code> is the Jaccard index of the core-name token sets computed by <code>jacc()</code>, which returns 0.0 when either set is empty. <code>n_first_eq</code> tests whether the first tokens coincide, a cheap proxy for brand agreement because a business name usually leads with its distinctive token. <code>n_init_eq</code> compares the strings of token initials on both sides. Both are booleans stored as floats.</p>
+
+  <h2>7.4 Alias and acronym features</h2>
+  <p>Chapter 5 splits a raw name on the explicit alias markers of the <code>_ALIAS</code> regex (<code>dba</code>, <code>d/b/a</code>, <code>doing business as</code>, <code>trading as</code>, <code>t/a</code>, <code>a.k.a.</code>, <code>also known as</code>, <code>formerly known as</code>; a bare <code>aka</code> is excluded because it can be a genuine name token) into the list <code>name_alts</code> of core-normalised variants, while <code>name_c</code> keeps the concatenation with the markers removed. <code>n_alias_best</code> is the maximum <code>token_sort_ratio</code> over every variant of L paired with every variant of R, so "Acme Holdings LLC dba Acme Pizza" scores 100 against "Acme Pizza" although the concatenated core name "acme holdings acme pizza" scores lower on <code>n_ratio</code> and <code>n_tsort</code> (<code>n_tset</code> and <code>n_partial</code> already reach 100 through the subset relation). <code>has_alias</code> flags pairs where either side has more than one variant; on every other pair <code>n_alias_best</code> equals <code>n_tsort</code>, so the flag tells the model when the alias score carries new information.</p>
+  <p><code>n_acronym</code> covers the opposite direction: one side is a single token equal to the initials of the other, multi-token side. Because <code>core_name()</code> already drops "of", "and" and "the", the initials of "state bank of india" are "sbi", the token a second source is likely to store. The feature is symmetric and, when it fires, carries information no character scorer does: "sbi" against "state bank india" scores about 32 on <code>n_ratio</code> and no better than 50 on <code>n_partial</code>.</p>
+  <aside class="warn"><strong>Risk.</strong> <code>n_tset</code>, <code>n_partial</code> and <code>n_acronym</code> reward subset relations, which chain branches also share ("acme pizza" against "acme pizza airport"). They buy recall on trade names at a price in precision; the address states of 7.5 and the context features of 7.7 are the counterweight, and Chapter 9 sets the operating point on the measured F<sub>0.5</sub>.</aside>
+
+  <h2>7.5 Address features</h2>
+  <p>Four scorers run on the cleaned address <code>addr_c</code>: <code>a_ratio</code>, <code>a_tset</code>, <code>a_partial</code> and <code>a_jacc</code>. Addresses carry more benign extra tokens than names (district or state names survive stop-word removal), so <code>a_tset</code> matters more here and is the address score used for the gap features.</p>
+  <p>The structured components yield agreement states rather than similarities. <code>postal_state</code> is ternary: 0 when either postal code is missing, 1 when both are present and equal, -1 when both are present and differ. The states are kept apart because a missing code is absence of information whereas a conflict is evidence against a match, which F<sub>0.5</sub> makes valuable. <code>house_state</code> applies the same encoding to the leading digit run <code>house</code>. <code>num_overlap</code> is the Jaccard of the digit-run sets <code>nums</code> (<code>_addr_nums()</code> removes the postal code unless it is also the leading number of the address, the case of a five-digit US house number with the ZIP missing), with the sentinel -1 when either side has no digits, so "nothing to compare" is distinct from "numbers present, none shared"; <code>num_conflict</code> makes the latter an explicit boolean.</p>
+
+  <h2>7.6 Lengths and source flag</h2>
+  <p><code>len_l</code>, <code>len_r</code>, <code>alen_l</code> and <code>alen_r</code> are the character lengths of core name and cleaned address on each side. A <code>ratio</code> of 80 on two 6-character names is one typo; on two 40-character names it is several, so the lengths let the model condition every similarity on the amount of text behind it. <code>is_s3</code> is 1 when the right record comes from Source 3 (<code>src</code> is the two-letter prefix of <code>entity_id</code>); it lets the model learn source-specific field quality, and <code>decode_table()</code> reuses the same column to group candidates per (S1, source).</p>
+
+  <h2>7.7 Context features</h2>
+  <p>Every feature so far is a function of the pair alone, but the metric is computed per Source 1 entity, and the question is not "is this pair similar" but "is this the right partner, given the alternatives". The context block gives the pairwise model that view through pandas group operations over the candidate table:</p>
+  <pre><code>for col in ["cos_full", "n_tset", "a_tset"]:
+    f[f"{col}_gap1"] = f[col] - f.groupby("i1")[col].transform("max")
+    f[f"{col}_gap2"] = f[col] - f.groupby("i2")[col].transform("max")
+f["rank1"] = f.groupby("i1")["cos_full"].rank(ascending=False, method="first")
+f["rank2"] = f.groupby("i2")["cos_full"].rank(ascending=False, method="first")
+f["n_cand1"] = f.groupby("i1")["i2"].transform("size")
+f["n_cand2"] = f.groupby("i2")["i1"].transform("size")</code></pre>
+  <p>For each of the three scores, <code>_gap1</code> is the pair value minus the best value among all candidates of the same S1 record, and <code>_gap2</code> the same relative to all S1 records competing for the same S2/S3 record; both are 0 for the leader and negative otherwise. <code>rank1</code> and <code>rank2</code> are the positions by <code>cos_full</code> on the two sides (1 = best; <code>method="first"</code> breaks ties by table order, so ranks are integers), and <code>n_cand1</code>, <code>n_cand2</code> are the group sizes. Figure 7.1 traces the computation for one S1 record.</p>
+
+  <figure>
+    <svg viewBox="0 0 800 480" width="100%" font-family="inherit" font-size="13" fill="#0f172a">
+      <defs>
+        <marker id="ch07-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="#334155"/>
+        </marker>
+      </defs>
+      <!-- S1 record -->
+      <rect x="20" y="150" width="210" height="80" rx="6" fill="#dbeafe" stroke="#334155"/>
+      <text x="32" y="172" font-weight="bold">S1-0421 (i1)</text>
+      <text x="32" y="192">acme pizza</text>
+      <text x="32" y="212">12 main street 10001</text>
+      <!-- second S1 competing for B -->
+      <rect x="20" y="320" width="210" height="80" rx="6" fill="#f1f5f9" stroke="#334155" stroke-dasharray="4 3"/>
+      <text x="32" y="342" font-weight="bold">S1-0980 (other i1)</text>
+      <text x="32" y="362">acme pizza bakery, 40 oak</text>
+      <text x="32" y="382">cos_full to B = 0.79</text>
+      <!-- candidates: cos_full of each pair with S1-0421 -->
+      <rect x="330" y="20" width="230" height="84" rx="6" fill="#dcfce7" stroke="#334155"/>
+      <text x="342" y="42" font-weight="bold">A: S2-0077</text>
+      <text x="342" y="62">acme pizza | 12 main street</text>
+      <text x="342" y="82">cos_full = 0.82</text>
+      <rect x="330" y="140" width="230" height="84" rx="6" fill="#fef3c7" stroke="#334155"/>
+      <text x="342" y="162" font-weight="bold">B: S3-0019</text>
+      <text x="342" y="182">acme pizza | 40 oak avenue</text>
+      <text x="342" y="202">cos_full = 0.71</text>
+      <rect x="330" y="260" width="230" height="84" rx="6" fill="#fee2e2" stroke="#334155"/>
+      <text x="342" y="282" font-weight="bold">C: S2-0005</text>
+      <text x="342" y="302">acme plaza hotel | 12 main st</text>
+      <text x="342" y="322">cos_full = 0.35</text>
+      <!-- arrows S1-0421 -> candidates -->
+      <line x1="230" y1="180" x2="330" y2="62" stroke="#334155" stroke-width="1.5" marker-end="url(#ch07-arrow)"/>
+      <line x1="230" y1="190" x2="330" y2="182" stroke="#334155" stroke-width="1.5" marker-end="url(#ch07-arrow)"/>
+      <line x1="230" y1="200" x2="330" y2="302" stroke="#334155" stroke-width="1.5" marker-end="url(#ch07-arrow)"/>
+      <!-- second S1 -> B -->
+      <line x1="230" y1="360" x2="330" y2="214" stroke="#334155" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ch07-arrow)"/>
+      <!-- derived features per candidate -->
+      <rect x="590" y="20" width="190" height="84" rx="6" fill="#e2e8f0" stroke="#334155"/>
+      <text x="600" y="42">gap1 = 0.82-0.82 = 0.00</text>
+      <text x="600" y="62">rank1 = 1, gap2 = 0.00</text>
+      <text x="600" y="82">rank2 = 1, n_cand2 = 1</text>
+      <rect x="590" y="140" width="190" height="84" rx="6" fill="#e2e8f0" stroke="#334155"/>
+      <text x="600" y="162">gap1 = 0.71-0.82 = -0.11</text>
+      <text x="600" y="182">rank1 = 2, gap2 = -0.08</text>
+      <text x="600" y="202">rank2 = 2, n_cand2 = 2</text>
+      <rect x="590" y="260" width="190" height="84" rx="6" fill="#e2e8f0" stroke="#334155"/>
+      <text x="600" y="282">gap1 = 0.35-0.82 = -0.47</text>
+      <text x="600" y="302">rank1 = 3, gap2 = 0.00</text>
+      <text x="600" y="322">rank2 = 1, n_cand2 = 1</text>
+      <!-- group summary -->
+      <rect x="20" y="420" width="760" height="52" rx="6" fill="#cbd5e1" stroke="#334155"/>
+      <text x="32" y="441">groupby(i1 = S1-0421): max cos_full = 0.82, n_cand1 = 3, ranks by cos_full descending</text>
+      <text x="32" y="461">groupby(i2 = B): max cos_full = 0.79 from S1-0980, so (S1-0421, B) has gap2 = 0.71-0.79 = -0.08</text>
+    </svg>
+    <figcaption>Figure 7.1 — Derivation of the cos_full gap, rank and crowding features for one Source 1 record with three candidates. Candidate B is also a candidate of another Source 1 record with a higher cos_full, which makes its gap2 negative and its rank2 equal to 2.</figcaption>
+  </figure>
+
+  <p>In the figure, candidate A is the mutual leader: gap1 = gap2 = 0, rank1 = rank2 = 1. Candidate B has a respectable absolute score and an identical core name but is dominated on both sides, by A for this S1 record and by S1-0980 for the S2/S3 record; candidate C is a different business at the same address. Without context the model would need one absolute threshold for B in every situation; with context it can learn that a dominated name-only match is typically a chain branch, and that a moderate leader is often right when its competitors trail far behind. The hard forms of the same idea are enforced afterwards by <code>decode_table()</code> and <code>decide()</code> (Chapter 9).</p>
+  <aside class="note"><strong>Design note.</strong> The three gap bases cover independent axes: <code>cos_full</code> for joint evidence, <code>n_tset</code> for the most permissive name score, <code>a_tset</code> for the most permissive address score. A pair leading on the address but trailing on the name is the signature of a co-located different business. Ranks and counts use <code>cos_full</code> only, since one ordering suffices for position.</aside>
+
+  <h2>7.8 Leakage, categorical handling and value encoding</h2>
+  <p>The context features are computed once on the complete candidate table of a split, before the GroupKFold of Chapter 8 is drawn. Groups by <code>i1</code> are fold-internal, since every candidate of an S1 record shares its fold; groups by <code>i2</code> cross folds, because the competitors of an S2/S3 record may be S1 records held out elsewhere. This is not label leakage: the group statistics use only unsupervised scores and counts, never <code>y</code>, and the identical computation is available at test time because <code>features()</code> runs on the complete test table. What would be leakage, and is absent, is any group aggregate of the label such as a target encoding of <code>i2</code>.</p>
+  <p>No column is declared categorical. <code>postal_state</code> and <code>house_state</code> are integers in {-1, 0, 1}; two numeric splits (below -0.5, above 0.5) isolate each state, so numeric handling is lossless. The country is intentionally not a feature: the test holds a country absent from training (Chapter 3), and a country column would invite splits that cannot transfer. No feature yields a missing value: <code>jacc()</code> returns 0.0 for empty sets and <code>num_overlap</code> uses the -1 sentinel. The layer costs nine fixed rapidfuzz calls per pair (six on names, three on addresses) plus |L.name_alts| × |R.name_alts| <code>token_sort_ratio</code> calls for <code>n_alias_best</code>; it is expected to be the largest CPU cost of the pipeline, to be confirmed from the run log timings of Chapter 12. Gain importances are reported in Table 7.3 once the run log is available.</p>
+
+  <table class="tbl">
+    <caption>Table 7.3 — Top gain importances of the final LightGBM model as printed by main(); to be filled from the run log</caption>
+    <thead><tr><th>Rank</th><th>Feature</th><th>Gain</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>to be filled from the run log</td><td>to be filled from the run log</td></tr>
+      <tr><td>2</td><td>to be filled from the run log</td><td>to be filled from the run log</td></tr>
+      <tr><td>3</td><td>to be filled from the run log</td><td>to be filled from the run log</td></tr>
+      <tr><td>4-15</td><td>to be filled from the run log</td><td>to be filled from the run log</td></tr>
+    </tbody>
+  </table>
+</section>

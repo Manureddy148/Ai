@@ -1,0 +1,209 @@
+<section class="chapter" id="ch-12">
+  <h1><span class="num">12</span> Performance, Complexity and Scalability</h1>
+  <p class="lead">This chapter gives the cost model of <code>er_pipeline.py</code>: the asymptotic complexity of every stage, the memory bounds that <code>topk_sparse()</code> and <code>pair_cos()</code> enforce by construction, time and memory estimates for three hypothetical dataset sizes, the knobs that trade recall, precision and run time, how to locate hot spots from the timestamps that <code>log()</code> prints, and the parallelism the code does and does not exploit. The pipeline has not yet been run on the competition data; every number a run would measure is marked as an estimate or left as a placeholder.</p>
+
+  <h2>12.1 Notation and cost model</h2>
+  <p>|S1| is the number of Source 1 records of a split, |B| = |S2| + |S3| the number of Source 2 and Source 3 records that <code>load_split()</code> concatenates, and |S1<sub>c</sub>|, |B<sub>c</sub>| the per-country blocks that <code>block()</code> forms by grouping on <code>country_n</code>. P is the number of candidate pairs, F = 38 the number of feature columns produced by <code>features()</code> (every column except <code>i1</code>, <code>i2</code>, <code>y</code>), R the number of boosting rounds trained, and nnz the number of non-zeros of a TF-IDF row. Train and test both pass through <code>prep() → block() → features()</code>, so per-split costs are paid twice; cross-validation, refit and the decode grid are paid once.</p>
+  <p>Two quantities dominate: the dense cell count of retrieval, Σ<sub>c</sub> |S1<sub>c</sub>| · |B<sub>c</sub>| per view, quadratic within a country because <code>topk_sparse()</code> materialises the score matrix with <code>toarray()</code>; and P, which bounds the feature stage, the model and the output, and is at most (k<sub>name</sub> + k<sub>full</sub> + k<sub>addr</sub> + k<sub>postal</sub>) · |S1| = 70 · |S1| before the union removes duplicates and the cosine floor of 0.05 drops empty overlaps.</p>
+
+  <h2>12.2 Asymptotic complexity per stage</h2>
+  <h3>12.2.1 Normalisation and TF-IDF</h3>
+  <p><code>prep()</code> applies <code>basic()</code>, <code>expand()</code>, <code>core_name()</code>, <code>name_parts()</code> and the regular expressions <code>_dotted</code>, <code>_punct</code> and <code>_space</code> (inside <code>basic()</code>), <code>_postal</code>, <code>_digits</code> and <code>_ALIAS</code> once per record, O((|S1| + |B|) · L) for average field length L, in pure Python. <code>block()</code> then fits three <code>TfidfVectorizer</code> instances (<code>char_wb</code>, <code>ngram_range=(2, 4)</code>, <code>min_df=2</code>) on the concatenated texts of each view and transforms both sides. The analyser is Python code emitting about three n-grams per character, so fitting plus transforming is O(3 · (|S1| + |B|) · L), and each row holds roughly 3L non-zeros at 8 bytes each (float32 value, int32 index); the <code>full</code> view, <code>name_c + " | " + addr_c</code>, has the longest rows.</p>
+
+  <h3>12.2.2 Top-k retrieval</h3>
+  <p>For every country and fuzzy view, <code>topk_sparse(A[i1], B[i2], k)</code> multiplies a chunk of S1 rows by the transposed block <code>BT</code>, densifies, and runs <code>np.argpartition</code> per row. The sparse product costs Σ<sub>g</sub> df<sub>A</sub>(g) · df<sub>B</sub>(g) over n-grams g, close to the dense bound because almost any two records share a frequent bigram; <code>toarray()</code> and <code>argpartition</code> are exactly Θ(|S1<sub>c</sub>| · |B<sub>c</sub>|). The stage is O(3 · Σ<sub>c</sub> |S1<sub>c</sub>| · |B<sub>c</sub>| · nnz), and country partitioning is what makes it affordable: two equal countries halve the cell count, while the open-set fallback for an unseen label costs a full |S1<sub>unseen</sub>| · |B| product (see Chapter 6). The postal view adds Σ<sub>p</sub> |S1<sub>p</sub>| · |B<sub>p</sub>| cells, normally negligible, plus one Python iteration and one <code>B.T.tocsr()</code> per postal code, so its cost is call overhead rather than arithmetic.</p>
+
+  <h3>12.2.3 Union, pair cosines and features</h3>
+  <p>The chunks are stacked with <code>np.vstack</code> and reduced by <code>drop_duplicates()</code>, O(P<sub>raw</sub>) with P<sub>raw</sub> ≤ 70 · |S1|; <code>pair_cos()</code> then computes the three cosines in slices of 200,000 pairs, O(P · nnz). <code>features()</code> is a sequence of list comprehensions: ten rapidfuzz calls per pair (<code>fuzz.ratio</code>, <code>token_sort_ratio</code>, <code>token_set_ratio</code>, <code>partial_ratio</code>, <code>JaroWinkler.similarity</code>, <code>fuzz.ratio</code> on the full name, at least one <code>token_sort_ratio</code> for <code>n_alias_best</code>, three address scorers) plus the Python-level <code>jacc()</code>, initials, acronym and number-set checks. Each scorer is O(|a| · |b|) worst case but runs in C++ on short strings, so the Python-to-C boundary dominates and the stage behaves as O(P) at tens of microseconds per pair. The context features (<code>_gap1</code>, <code>_gap2</code>, <code>rank1</code>, <code>rank2</code>, <code>n_cand1</code>, <code>n_cand2</code>) are vectorised group-by transforms, O(P log P) at most.</p>
+
+  <h3>12.2.4 Matcher and decode grid</h3>
+  <p>With <code>GroupKFold(args.folds)</code> each fold trains on (1 − 1/folds) · P rows for up to 2,000 rounds with early stopping at patience 100; histogram boosting costs O(rows · F · R) per fit, scaled by <code>feature_fraction=0.8</code> and <code>bagging_fraction=0.8</code>, and the refit runs 1.1 · mean(best_iteration) rounds on all P rows. Prediction is O(P · R). <code>decode_table()</code> sorts once, O(P log P), and <code>drop_duplicates("i2")</code> leaves |d| ≤ min(P, |B|) rows, which keeps the grid off the P axis. The sweep has 6 ratios × 31 thresholds (<code>np.arange(0.20, 0.96, 0.025)</code>) = 186 points, each a vectorised mask in <code>decide()</code>, a Python loop over kept rows in <code>to_lists()</code> and a loop over all S1 entities in <code>macro_f05()</code>: O(|d| + |S1|) per point at a few microseconds per entity.</p>
+
+  <table class="tbl">
+    <caption>Table 12.1 — Asymptotic complexity per stage (per split unless marked train-only).</caption>
+    <thead><tr><th>Stage</th><th>Function(s)</th><th>Time</th><th>Peak transient memory</th><th>Executes in</th></tr></thead>
+    <tbody>
+      <tr><td>Load + normalise</td><td><code>load_split()</code>, <code>prep()</code></td><td>O((|S1| + |B|) · L)</td><td>Derived object columns</td><td>pandas parser; Python, 1 core</td></tr>
+      <tr><td>TF-IDF fit + transform (3 views)</td><td><code>block()</code></td><td>O(3 · (|S1| + |B|) · L)</td><td>8 B per non-zero, ≈ 3L non-zeros per row per view</td><td>Python analyser, 1 core</td></tr>
+      <tr><td>Top-k retrieval (3 views)</td><td><code>topk_sparse()</code></td><td>Θ(3 · Σ<sub>c</sub> |S1<sub>c</sub>| · |B<sub>c</sub>|) cells × nnz constant</td><td>Bounded: 2 × 10<sup>7</sup> cells × (4 + 8) B + sparse product ≈ 0.4 GB</td><td>SciPy / NumPy, 1 core</td></tr>
+      <tr><td>Postal view</td><td><code>topk_sparse()</code> per postal code</td><td>O(Σ<sub>p</sub> |S1<sub>p</sub>| · |B<sub>p</sub>|) + O(#postal codes) calls</td><td>Small blocks</td><td>Python loop + NumPy</td></tr>
+      <tr><td>Union + pair cosines</td><td><code>drop_duplicates()</code>, <code>pair_cos()</code></td><td>O(P<sub>raw</sub>) + O(P · nnz)</td><td>Bounded: 200,000 rows × 2 matrices per slice</td><td>NumPy / SciPy, 1 core</td></tr>
+      <tr><td>Pair features</td><td><code>features()</code></td><td>O(P) rapidfuzz + O(P log P) ranks</td><td>≈ 1 KB per pair (L, R frames, tuple lists, F columns)</td><td>Python + rapidfuzz, 1 core</td></tr>
+      <tr><td>Matcher CV + refit (train-only)</td><td><code>lgb.train()</code></td><td>O(P · F · R · (folds + 0.1))</td><td>float64 copies of fold slices + binned <code>Dataset</code></td><td>LightGBM, all cores</td></tr>
+      <tr><td>Decode grid (train-only)</td><td><code>decode_table()</code>, <code>decide()</code>, <code>to_lists()</code>, <code>macro_f05()</code></td><td>O(P log P) + 186 · O(|d| + |S1|)</td><td>One filtered copy of d per point</td><td>Python, 1 core</td></tr>
+      <tr><td>Predict + decode + write (test)</td><td><code>model.predict()</code>, <code>decide()</code>, file loop</td><td>O(P · R) + O(|S1| + |d|)</td><td>Two id-list dictionaries</td><td>LightGBM (cores) + Python</td></tr>
+    </tbody>
+  </table>
+
+  <h2>12.3 Memory model</h2>
+  <p>The two stages that could allocate proportionally to |S1| · |B| are bounded by construction. In <code>topk_sparse()</code> the chunk is <code>max(16, int(max_cells // n_b))</code> with <code>max_cells = 2e7</code>, so the dense float32 score block never exceeds about 80 MB (the floor of 16 rows only matters beyond 1.25 million rows in a block), the full-width int64 output of <code>np.argpartition</code> about 160 MB, and the nearly dense sparse product a further 160 MB; the top-k slice is taken with <code>.copy()</code> so the full-width array is released every iteration rather than pinned by a view (Figure 12.2 in 12.6). <code>pair_cos()</code> bounds its transient through slices of 200,000 pairs. Neither bound depends on block size, so an unseen country falling back to all of B costs time, not memory.</p>
+  <p>What grows is per-pair state. The feature frame holds about 40 columns of 8 bytes, 320 bytes per pair; inside <code>features()</code> the row-aligned copies L and R and the lists of string tuples roughly triple that. During cross-validation <code>ftr.iloc[a][feats]</code> and the validation slice make float64 copies of about 300 bytes per row beside the binned LightGBM <code>Dataset</code>, and <code>ftr</code> is still referenced while <code>fte</code> is built, so both frames are resident at test time. The TF-IDF matrices, about 3.2 KB per record for three views at 400 non-zeros per record, are local to <code>block()</code>. Table 12.2 combines these unit costs for three hypothetical sizes; the values are estimates, not measurements.</p>
+
+  <table class="tbl">
+    <caption>Table 12.2 — Estimated memory and wall-clock for three hypothetical sizes (ESTIMATES from the cost model; assumptions: |B| = 2 · |S1|, two equal countries, test split the same size as train, ≈ 50 pairs per S1 after union, 5 × 10<sup>7</sup> dense cells/s in retrieval, 40 µs per pair in <code>features()</code>, ≈ 500 rounds per fold, 4 cores).</caption>
+    <thead><tr><th>Quantity</th><th>Small: 20k S1</th><th>Medium: 100k S1</th><th>Large: 500k S1</th></tr></thead>
+    <tbody>
+      <tr><td>|B| = |S2| + |S3|</td><td>40k</td><td>200k</td><td>1M</td></tr>
+      <tr><td>Candidate pairs P (per split)</td><td>≈ 1M</td><td>≈ 5M</td><td>≈ 25M</td></tr>
+      <tr><td>Dense retrieval cells (3 views, per split)</td><td>1.2 × 10<sup>9</sup></td><td>3 × 10<sup>10</sup></td><td>7.5 × 10<sup>11</sup></td></tr>
+      <tr><td>TF-IDF matrices (3 views)</td><td>≈ 0.2 GB</td><td>≈ 1 GB</td><td>≈ 5 GB</td></tr>
+      <tr><td>Feature frame (one split)</td><td>≈ 0.3 GB</td><td>≈ 1.6 GB</td><td>≈ 8 GB</td></tr>
+      <tr><td>Peak during <code>features()</code></td><td>≈ 1 GB</td><td>≈ 5 GB</td><td>≈ 25 GB</td></tr>
+      <tr><td>Estimated peak RSS of the run</td><td>≈ 1.5 GB</td><td>≈ 6–8 GB</td><td>≈ 28–30 GB</td></tr>
+      <tr><td>TF-IDF fit + transform (both splits)</td><td>≈ 0.5 min</td><td>≈ 2.5 min</td><td>≈ 12 min</td></tr>
+      <tr><td>Top-k retrieval (both splits)</td><td>≈ 1 min</td><td>≈ 20 min</td><td>≈ 8.5 h</td></tr>
+      <tr><td><code>features()</code> (both splits)</td><td>≈ 1.5 min</td><td>≈ 7 min</td><td>≈ 35 min</td></tr>
+      <tr><td>LightGBM 5-fold CV + refit</td><td>≈ 4 min</td><td>≈ 20 min</td><td>≈ 100 min</td></tr>
+      <tr><td>Decode grid (186 points)</td><td>≈ 15 s</td><td>≈ 75 s</td><td>≈ 6 min</td></tr>
+      <tr><td>Total wall-clock (estimate)</td><td>≈ 8–10 min</td><td>≈ 50–60 min</td><td>≈ 11–12 h</td></tr>
+    </tbody>
+  </table>
+  <aside class="warn"><strong>Risk.</strong> The quadratic retrieval term is invisible at the small size and dominant at the large one. If one country holds most records, the retrieval estimate must be re-derived from the actual Σ<sub>c</sub> |S1<sub>c</sub>| · |B<sub>c</sub>| given by the <code>profile()</code> country counts before a Kaggle session is committed.</aside>
+
+  <h2>12.4 Scaling knobs</h2>
+  <p>Every knob in Table 12.3 moves at least two of recall ceiling, precision and run time, and the metric of Chapter 2 decides the direction. Because F<sub>0.5</sub> weights precision twice and a singleton scores 1.0 only for an empty prediction, extra candidates are not free even with a good matcher: each is a chance for a false positive the threshold must absorb. Raising a top-k pays only when the <code>blocking recall by country</code> or <code>by source</code> lines show true pairs being missed; lowering it is the first response when the run exceeds the budget.</p>
+
+  <table class="tbl">
+    <caption>Table 12.3 — Tuning knobs and their effect on the recall ceiling, precision and run time.</caption>
+    <thead><tr><th>Knob (location)</th><th>Default</th><th>Recall ceiling</th><th>Precision / F<sub>0.5</sub></th><th>Time and memory</th></tr></thead>
+    <tbody>
+      <tr><td><code>k_name</code>, <code>k_full</code> (<code>block()</code>)</td><td>25, 25</td><td>Up with k, diminishing beyond a few tens</td><td>More low-similarity candidates to reject; harder singletons</td><td>P, hence <code>features()</code>, LightGBM and frame memory, ≈ linear; retrieval unchanged</td></tr>
+      <tr><td><code>k_addr</code>, <code>k_postal</code> (<code>block()</code>)</td><td>10, 10</td><td>Recovers name-rewritten matches</td><td>Address-only pairs are the noisiest candidates</td><td>As above, smaller share of P</td></tr>
+      <tr><td>Cosine floor <code>sc &gt; 0.05</code> (<code>block()</code>)</td><td>0.05</td><td>0.05 removes only near-empty n-gram overlaps; loss grows with the floor</td><td>Removes pairs sharing almost nothing</td><td>Reduces P at the union only</td></tr>
+      <tr><td><code>max_cells</code> (<code>topk_sparse()</code>)</td><td>2 × 10<sup>7</sup></td><td>None</td><td>None</td><td>Transient ∝ <code>max_cells</code>; larger chunks amortise Python overhead</td></tr>
+      <tr><td><code>chunk</code> (<code>pair_cos()</code>)</td><td>200,000</td><td>None</td><td>None</td><td>Transient memory only</td></tr>
+      <tr><td><code>ngram_range</code>, <code>min_df</code> (<code>block()</code>)</td><td>(2, 4), 2</td><td>Narrower range: coarser cosines</td><td>Indirect, through cosine features</td><td>nnz per row and TF-IDF memory ∝ number of n-gram sizes</td></tr>
+      <tr><td><code>--folds</code> (CLI)</td><td>5</td><td>None</td><td>Fewer folds: noisier OOF and (thr, ratio)</td><td>CV time ∝ folds; grid unchanged</td></tr>
+      <tr><td><code>num_leaves</code>, <code>learning_rate</code> (<code>params</code>)</td><td>63, 0.05</td><td>None</td><td>Capacity vs. over-fitting, checked by early stopping</td><td>Rounds ∝ 1/<code>learning_rate</code>; cost per round ∝ leaves</td></tr>
+      <tr><td>Early-stopping patience, max rounds</td><td>100, 2,000</td><td>None</td><td>Marginal</td><td>Bounds R</td></tr>
+      <tr><td>Grid: ratio set × <code>thr</code> step</td><td>6 × 31 = 186</td><td>None</td><td>Finer step: better operating point, more OOF over-fitting</td><td>∝ points × (|d| + |S1|)</td></tr>
+      <tr><td><code>n_jobs</code> (<code>params</code>)</td><td>−1</td><td>None</td><td>None</td><td>LightGBM uses every core</td></tr>
+    </tbody>
+  </table>
+
+  <h2>12.5 Where time goes and how to profile it</h2>
+  <p>Figure 12.1 shows the expected split of wall-clock at the medium size: retrieval and cross-validation take two thirds, the rapidfuzz loop is the third block, and TF-IDF fitting, the grid and I/O are minor. At the small size LightGBM dominates because the quadratic blocks are tiny; at the large size retrieval swamps everything.</p>
+  <figure>
+    <svg viewBox="0 0 800 400" width="100%" font-family="inherit" font-size="13">
+      <text x="20" y="22" fill="#0f172a">Illustrative share of wall-clock at the medium size (train + test), estimate from Table 12.2</text>
+      <text x="20" y="57" fill="#0f172a">TF-IDF fit/transform</text>
+      <rect x="240" y="44" width="50" height="20" rx="6" fill="#dbeafe" stroke="#334155"/>
+      <text x="298" y="59" fill="#0f172a">5%</text>
+      <text x="20" y="92" fill="#0f172a">topk_sparse() retrieval</text>
+      <rect x="240" y="79" width="400" height="20" rx="6" fill="#dbeafe" stroke="#334155"/>
+      <text x="648" y="94" fill="#0f172a">40%</text>
+      <text x="20" y="127" fill="#0f172a">union + pair_cos()</text>
+      <rect x="240" y="114" width="20" height="20" rx="6" fill="#dbeafe" stroke="#334155"/>
+      <text x="268" y="129" fill="#0f172a">2%</text>
+      <text x="20" y="162" fill="#0f172a">rapidfuzz pair features</text>
+      <rect x="240" y="149" width="140" height="20" rx="6" fill="#dcfce7" stroke="#334155"/>
+      <text x="388" y="164" fill="#0f172a">14%</text>
+      <text x="20" y="197" fill="#0f172a">context features (groupby)</text>
+      <rect x="240" y="184" width="20" height="20" rx="6" fill="#dcfce7" stroke="#334155"/>
+      <text x="268" y="199" fill="#0f172a">2%</text>
+      <text x="20" y="232" fill="#0f172a">LightGBM 5-fold CV</text>
+      <rect x="240" y="219" width="280" height="20" rx="6" fill="#fef3c7" stroke="#334155"/>
+      <text x="528" y="234" fill="#0f172a">28%</text>
+      <text x="20" y="267" fill="#0f172a">LightGBM refit + predict</text>
+      <rect x="240" y="254" width="50" height="20" rx="6" fill="#fef3c7" stroke="#334155"/>
+      <text x="298" y="269" fill="#0f172a">5%</text>
+      <text x="20" y="302" fill="#0f172a">decode grid (186 points)</text>
+      <rect x="240" y="289" width="30" height="20" rx="6" fill="#fee2e2" stroke="#334155"/>
+      <text x="278" y="304" fill="#0f172a">3%</text>
+      <text x="20" y="337" fill="#0f172a">load, prep(), output</text>
+      <rect x="240" y="324" width="10" height="20" rx="6" fill="#e2e8f0" stroke="#334155"/>
+      <text x="258" y="339" fill="#0f172a">1%</text>
+      <line x1="240" y1="36" x2="240" y2="352" stroke="#334155" stroke-width="1"/>
+      <text x="20" y="382" fill="#0f172a">Blue: blocking (1 core) · Green: features (1 core) · Amber: LightGBM (all cores) · Red: decode (1 core)</text>
+    </svg>
+    <figcaption>Figure 12.1 — Where time goes (illustrative estimate at the medium size; to be replaced by measured intervals from the run log).</figcaption>
+  </figure>
+  <p>The pipeline carries its own coarse profiler: <code>log()</code> prefixes every message with the seconds elapsed since module import (<code>T0</code>), so the difference between consecutive lines is the duration of the code between them, and Table 12.4 maps each interval to the stage it measures. Two intervals are composite: the last <code>profile()</code> line to the first <code>blocking:</code> line covers <code>prep()</code> of all four frames plus <code>block(tr1, tr2)</code>, and the <code>blocking oracle</code> line to the second <code>blocking:</code> line covers the refit, the importance print and <code>block(te1, te2)</code>; a <code>log()</code> call after <code>prep()</code> and before the refit would separate them. For finer resolution the script runs unchanged under <code>python -m cProfile -o run.prof er_pipeline.py</code>, which attributes time to <code>topk_sparse()</code>, each rapidfuzz scorer and <code>lgb.train()</code> individually.</p>
+
+  <table class="tbl">
+    <caption>Table 12.4 — Log-line intervals and the stage each one measures.</caption>
+    <thead><tr><th>From log line</th><th>To log line</th><th>Stage measured</th></tr></thead>
+    <tbody>
+      <tr><td><code>data dir:</code></td><td>first <code>== train:</code></td><td><code>load_split()</code> for both splits</td></tr>
+      <tr><td>last <code>== test:</code> block</td><td>first <code>blocking:</code></td><td><code>prep()</code> × 4 + <code>block(tr1, tr2)</code></td></tr>
+      <tr><td>first <code>blocking:</code></td><td><code>blocking recall ceiling:</code></td><td><code>features(ctr, ...)</code> + labelling</td></tr>
+      <tr><td><code>blocking recall by source:</code></td><td><code>fold 0:</code></td><td>First fold of <code>lgb.train()</code></td></tr>
+      <tr><td><code>fold k:</code></td><td><code>fold k+1:</code></td><td>Fold k+1 training + prediction</td></tr>
+      <tr><td><code>fold 4:</code></td><td><code>OOF macro F0.5</code></td><td><code>decode_table()</code> + 186-point grid</td></tr>
+      <tr><td><code>OOF macro F0.5</code></td><td><code>blocking oracle</code></td><td>Floor and ceiling evaluations (2 × <code>macro_f05()</code>)</td></tr>
+      <tr><td><code>blocking oracle</code></td><td>second <code>blocking:</code></td><td>Refit + importances + <code>block(te1, te2)</code></td></tr>
+      <tr><td>second <code>blocking:</code></td><td><code>wrote .../matching_results.tsv</code></td><td><code>features(cte, ...)</code> + predict + decode + write</td></tr>
+    </tbody>
+  </table>
+
+  <table class="tbl">
+    <caption>Table 12.5 — Measured stage timings and peak memory (to be filled from the run log).</caption>
+    <thead><tr><th>Interval (Table 12.4)</th><th>Train split</th><th>Test split</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>Load + prep</td><td>to be filled from the run log</td><td>to be filled from the run log</td><td></td></tr>
+      <tr><td><code>block()</code></td><td>to be filled from the run log</td><td>to be filled from the run log</td><td>pairs per S1: to be filled from the run log</td></tr>
+      <tr><td><code>features()</code></td><td>to be filled from the run log</td><td>to be filled from the run log</td><td></td></tr>
+      <tr><td>LightGBM folds 0–4 (best_iter)</td><td>to be filled from the run log</td><td>—</td><td></td></tr>
+      <tr><td>Decode grid</td><td>to be filled from the run log</td><td>—</td><td></td></tr>
+      <tr><td>Refit + test predict + write</td><td>—</td><td>to be filled from the run log</td><td></td></tr>
+      <tr><td>Total wall-clock / peak RSS</td><td colspan="2">to be filled from the run log</td><td>Kaggle session monitor</td></tr>
+    </tbody>
+  </table>
+
+  <h2>12.6 Parallelism and optimisation opportunities</h2>
+  <p>Only LightGBM is multi-threaded. The <code>char_wb</code> analyser, the SciPy sparse product, <code>np.argpartition</code>, the rapidfuzz comprehensions, the pandas group-bys and the decode grid run on one core, so on a four-core machine three cores idle for roughly two thirds of the run at the medium size. Three changes, none altering an output value, would recover most of that:</p>
+  <ol>
+    <li><strong>Vectorised string scoring.</strong> Recent rapidfuzz releases provide <code>rapidfuzz.process.cpdist(queries, choices, scorer=..., workers=-1)</code>, which scores the i-th query against the i-th choice in C++ threads and returns a NumPy array; one call per feature replaces each comprehension in <code>features()</code> and uses every core. <code>process.cdist</code> is the all-pairs variant, appropriate only inside one small block. <code>requirements.txt</code> pins only <code>rapidfuzz&gt;=3.0</code>, and <code>cpdist</code> is absent from the earliest 3.x releases, so the installed version must be checked.</li>
+    <li><strong>Process pools for retrieval.</strong> The per-country, per-view loop in <code>block()</code> is embarrassingly parallel, since each <code>topk_sparse()</code> call touches only its own row slices; a <code>concurrent.futures.ProcessPoolExecutor</code> over (country, view) tasks multiplies throughput by the core count at the price of one bounded transient per worker (Figure 12.2).</li>
+    <li><strong>Vectorised grid.</strong> Replacing <code>to_lists()</code> and <code>macro_f05()</code> by group-by counts of true positives per S1 entity makes each grid point O(|d|) NumPy work, so a finer threshold step becomes free.</li>
+  </ol>
+  <figure>
+    <svg viewBox="0 0 800 250" width="100%" font-family="inherit" font-size="13">
+      <defs>
+        <marker id="ch12-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="#334155"/>
+        </marker>
+      </defs>
+      <rect x="20" y="30" width="150" height="70" rx="6" fill="#dbeafe" stroke="#334155"/>
+      <text x="95" y="55" text-anchor="middle" fill="#0f172a">A[i : i+chunk]</text>
+      <text x="95" y="75" text-anchor="middle" fill="#0f172a">sparse, chunk rows</text>
+      <rect x="215" y="30" width="150" height="70" rx="6" fill="#dbeafe" stroke="#334155"/>
+      <text x="290" y="55" text-anchor="middle" fill="#0f172a">@ BT (V × |B|)</text>
+      <text x="290" y="75" text-anchor="middle" fill="#0f172a">sparse product</text>
+      <rect x="410" y="30" width="170" height="70" rx="6" fill="#fef3c7" stroke="#334155"/>
+      <text x="495" y="55" text-anchor="middle" fill="#0f172a">S = toarray()</text>
+      <text x="495" y="75" text-anchor="middle" fill="#0f172a">chunk × |B| float32 ≈ 80 MB</text>
+      <rect x="625" y="30" width="155" height="70" rx="6" fill="#fee2e2" stroke="#334155"/>
+      <text x="702" y="55" text-anchor="middle" fill="#0f172a">argpartition</text>
+      <text x="702" y="75" text-anchor="middle" fill="#0f172a">int64 ≈ 160 MB</text>
+      <line x1="170" y1="65" x2="213" y2="65" stroke="#334155" stroke-width="1.5" marker-end="url(#ch12-arrow)"/>
+      <line x1="365" y1="65" x2="408" y2="65" stroke="#334155" stroke-width="1.5" marker-end="url(#ch12-arrow)"/>
+      <line x1="580" y1="65" x2="623" y2="65" stroke="#334155" stroke-width="1.5" marker-end="url(#ch12-arrow)"/>
+      <rect x="410" y="150" width="370" height="60" rx="6" fill="#dcfce7" stroke="#334155"/>
+      <text x="595" y="173" text-anchor="middle" fill="#0f172a">part[:, -k:].copy()  →  chunk × k int64, kept</text>
+      <text x="595" y="193" text-anchor="middle" fill="#0f172a">full-width arrays freed before the next chunk</text>
+      <line x1="702" y1="100" x2="702" y2="148" stroke="#334155" stroke-width="1.5" marker-end="url(#ch12-arrow)"/>
+      <rect x="20" y="150" width="345" height="60" rx="6" fill="#f1f5f9" stroke="#334155"/>
+      <text x="192" y="173" text-anchor="middle" fill="#0f172a">chunk = max(16, 2e7 // |B|)</text>
+      <text x="192" y="193" text-anchor="middle" fill="#0f172a">chunk × |B| ≤ 2 × 10⁷ cells (floor: 16 rows)</text>
+      <text x="400" y="238" text-anchor="middle" fill="#0f172a">Loop over i in range(0, |A|, chunk): ⌈|A| · |B| / 2e7⌉ iterations per view and country</text>
+    </svg>
+    <figcaption>Figure 12.2 — Memory bound of <code>topk_sparse()</code>: the chunk width is derived from |B|, so the dense transient is constant regardless of block size and one such transient per worker is affordable.</figcaption>
+  </figure>
+  <aside class="note"><strong>Design note.</strong> The single-threaded loops are kept because they make the feature definitions readable and auditable for the fair-play review of Chapter 13; the optimisations above preserve every feature value and head the roadmap of Chapter 14.</aside>
+
+  <h2>12.7 Kaggle limits and capacity</h2>
+  <p>The reference environment is a Kaggle CPU notebook, which at the time of writing offers 4 virtual cores, about 30 GB of RAM, 20 GB of scratch under <code>/kaggle/working</code> and a 12-hour wall-clock limit per session; these limits change and must be re-checked before a run is scheduled. The cost model places the small and medium sizes inside that envelope and the large size outside it on both axes (Table 12.6). Out-of-memory is the failure mode to guard against first: it ends the session abruptly, typically inside <code>features()</code> or a fold, whereas a run that is merely slow can be stopped after the train-side log lines needed to calibrate the estimates have appeared, since <code>log()</code> flushes every line.</p>
+
+  <table class="tbl">
+    <caption>Table 12.6 — Capacity envelope on a 4-core, 30 GB, 12-hour Kaggle CPU session (estimates).</caption>
+    <thead><tr><th>Size</th><th>Peak RSS vs. 30 GB</th><th>Wall-clock vs. 12 h</th><th>Verdict as shipped</th><th>Changes that restore headroom</th></tr></thead>
+    <tbody>
+      <tr><td>Small (20k S1)</td><td>≈ 5%</td><td>≈ 1.5%</td><td>Fits; LightGBM dominates</td><td>None needed; a finer grid step is affordable</td></tr>
+      <tr><td>Medium (100k S1)</td><td>≈ 25%</td><td>≈ 8%</td><td>Fits with wide margin</td><td>None needed; <code>cpdist</code> halves <code>features()</code></td></tr>
+      <tr><td>Large (500k S1)</td><td>≈ 95–100%</td><td>≈ 95–100%</td><td>Does not fit reliably</td><td>Halve <code>k_name</code>/<code>k_full</code>; delete <code>ftr</code> after the refit; process-pool retrieval; or block each country in a separate session</td></tr>
+      <tr><td>Actual competition split</td><td>to be filled from the run log</td><td>to be filled from the run log</td><td>to be filled from the run log</td><td></td></tr>
+    </tbody>
+  </table>
+  <p>The verdicts are read against the metric as well as the budget. Lowering a top-k lowers the recall ceiling, but the singleton term rewards the cleaner candidate lists that result, so a modest reduction is often neutral on OOF F<sub>0.5</sub>; the <code>blocking oracle</code> and <code>floor</code> lines of the log (see Chapter 10) show whether a given k has moved the ceiling by more than the matcher can recover, and they are the first numbers to read once Table 12.5 is filled.</p>
+</section>

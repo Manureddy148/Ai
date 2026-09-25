@@ -1,0 +1,146 @@
+<section class="chapter" id="ch-02">
+  <h1><span class="num">2</span> Problem Statement and Evaluation Metric</h1>
+  <p class="lead">This chapter states the task as the challenge defines it, fixes the file formats the pipeline must read and write, and derives the evaluation metric from first principles. The metric is a macro-average of the per-entity F<sub>0.5</sub> score over every Source 1 entity, with an all-or-nothing rule for entities that have no true match. Precision weighting, equal weight per entity and the singleton rule each shape one or more stages of the pipeline described in Chapters 5 to 11; the closing table maps those consequences to the functions in <code>er_pipeline.py</code> that implement them.</p>
+
+  <h2>2.1 Formal task definition</h2>
+  <p>Three independent data sources describe overlapping sets of real-world businesses. Each record carries a free-text business name, a free-text address and a country label, but no shared key. <strong>Source 1</strong> (S1) is designated the <em>deduplicated reference source</em>: every S1 record stands for a distinct real-world entity. <strong>Source 2</strong> (S2) and <strong>Source 3</strong> (S3) are the sources to be linked. The task is, for every S1 record, to return the set of S2 and S3 records that describe the same business. That set may be empty (the S1 entity is a <em>singleton</em>), contain one record, or contain many records, possibly from both S2 and S3. Neither S2-to-S3 nor S1-to-S1 links are requested; a self-match to an S1 identifier is a validation error.</p>
+  <p>Formally, let E be the set of S1 entities and O the union of S2 and S3 records. The ground truth is a function g: E → 2<sup>O</sup> assigning each S1 entity a (possibly empty) subset of O; a submission is another function h: E → 2<sup>O</sup> on the same domain, with every element of E appearing exactly once. <code>load_split()</code> reads g from <code>train_ground_truth.tsv</code> into a dictionary from S1 identifier to a Python set, discarding empty tokens so that a blank list becomes the empty set.</p>
+  <p>One structural assumption follows from S1 being deduplicated: because two S1 records never denote the same business, an S2 or S3 record belongs to the ground-truth set of at most one S1 entity. The decision layer exploits this in <code>decode_table()</code>, which keeps each S2/S3 record only in the pair where it scores highest (see Chapter 9).</p>
+  <p>The country label is an <em>open set</em>. Training records are labelled <code>US</code> or <code>India</code>; test records additionally carry <code>France</code>, which never occurs in training. The rules forbid hard-coding, filtering or one-hot encoding the pipeline to the two training values and require a row for every test S1 entity, French ones included. <code>block()</code> partitions candidates by country but falls back to the full S2/S3 index for a label without counterpart (Chapter 6).</p>
+
+  <h2>2.2 File formats</h2>
+  <p>All files are tab-separated because both the address column and the identifier-list columns legitimately contain commas. The pipeline reads every file through <code>read_tsv()</code> with <code>sep="\t"</code>, <code>dtype=str</code>, <code>keep_default_na=False</code> and <code>quoting=3</code> (no quote processing), so that a quote character inside a name or an empty address survives loading unchanged. Table 2.1 lists the seven input files and the two output files; the column names are contractual, since <code>utils/validate_submission.py</code> splits the header line on tabs and requires it to equal <code>["source1_entity_id", list_col]</code> exactly.</p>
+  <table class="tbl">
+    <caption>Table 2.1 — Input and output files with exact column names</caption>
+    <thead><tr><th>File</th><th>Split</th><th>Columns (in order)</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td><code>train_source1.tsv</code>, <code>test_source1.tsv</code></td><td>train, test</td><td><code>entity_id</code>, <code>business_name</code>, <code>business_address</code>, <code>country</code></td><td>Reference source. Identifiers prefixed <code>S1-</code>. One row per real-world entity.</td></tr>
+      <tr><td><code>train_source2.tsv</code>, <code>test_source2.tsv</code></td><td>train, test</td><td>same four columns</td><td>Identifiers prefixed <code>S2-</code>. Concatenated with S3 by <code>load_split()</code>.</td></tr>
+      <tr><td><code>train_source3.tsv</code>, <code>test_source3.tsv</code></td><td>train, test</td><td>same four columns</td><td>Identifiers prefixed <code>S3-</code>. Source is recoverable from the prefix (<code>src</code> column in <code>prep()</code>).</td></tr>
+      <tr><td><code>train_ground_truth.tsv</code></td><td>train only</td><td><code>source1_entity_id</code>, <code>matched_entity_ids</code></td><td>Second column is a comma-separated list of S2/S3 identifiers, empty for singletons. No test counterpart is distributed.</td></tr>
+      <tr><td><code>output/matching_results.tsv</code></td><td>test (produced)</td><td><code>source1_entity_id</code>, <code>matched_entity_ids</code></td><td>The only file scored. Exactly one row per test S1 entity; empty second column for singletons; no duplicates within a list; only S2/S3 identifiers that exist in the test set.</td></tr>
+      <tr><td><code>output/candidate_pairs.tsv</code></td><td>test (produced)</td><td><code>source1_entity_id</code>, <code>candidate_entity_ids</code></td><td>Not scored. Must be the exact set the matcher scored; every identifier in <code>matching_results.tsv</code> must also appear here.</td></tr>
+    </tbody>
+  </table>
+  <p>Both outputs are written by the same loop in <code>main()</code>, which iterates over <code>te1.entity_id</code> in file order and de-duplicates each list with <code>dict.fromkeys()</code>. The candidate file comes from the <code>(i1, i2)</code> table that <code>features()</code> received, so the required subset relation holds by construction (Chapter 11).</p>
+
+  <h2>2.3 The evaluation metric</h2>
+  <h3>2.3.1 From F<sub>β</sub> to F<sub>0.5</sub></h3>
+  <p>For one S1 entity with predicted set h(e) and true set g(e), <strong>precision</strong> P is the fraction of predicted identifiers that are correct and <strong>recall</strong> R is the fraction of true identifiers that were predicted. The general F<sub>β</sub> score is the weighted harmonic mean of the two:</p>
+  <p>F<sub>β</sub> = (1 + β<sup>2</sup>) · P · R / (β<sup>2</sup> · P + R), equivalently 1 / F<sub>β</sub> = (1 / (1 + β<sup>2</sup>)) · (1 / P) + (β<sup>2</sup> / (1 + β<sup>2</sup>)) · (1 / R).</p>
+  <p>The parameter β expresses how many times more important recall is than precision. Setting β = 0.5 gives β<sup>2</sup> = 0.25 and 1 + β<sup>2</sup> = 1.25, hence the formula printed in the problem statement:</p>
+  <p>F<sub>0.5</sub> = 1.25 · P · R / (0.25 · P + R).</p>
+  <p>In the harmonic-mean form the reciprocal of precision carries weight 0.8 and the reciprocal of recall weight 0.2. Along the diagonal P = R, ∂F<sub>0.5</sub>/∂P = 0.8 and ∂F<sub>0.5</sub>/∂R = 0.2, so a unit gain in precision is worth four times a unit gain in recall at a balanced operating point; the statement's "2×" phrasing refers to β = 1/2.</p>
+  <p>Substituting P = tp / m and R = tp / n, where tp is the number of correct identifiers, m = |h(e)| the number predicted and n = |g(e)| the number true, the per-entity score collapses to a form that makes the asymmetry concrete:</p>
+  <p>F<sub>0.5</sub>(e) = 1.25 · tp / (m + 0.25 · n).</p>
+  <p>Every wrong identifier adds a full unit to the denominator; every missed true identifier adds only a quarter. This is the single most important fact about the metric for the design of the decision layer.</p>
+
+  <h3>2.3.2 Macro-averaging over S1 entities</h3>
+  <p>The leaderboard score is the arithmetic mean of F<sub>0.5</sub>(e) over all S1 entities in the evaluation set. This is a <em>macro</em> average: an entity with twelve true matches and an entity with one contribute equally, and an entity with true matches none of which blocking paired with it contributes exactly zero however good the matcher is elsewhere (a singleton with no candidates, by contrast, scores 1.0 automatically). The pipeline reproduces the definition verbatim: <code>f05()</code> implements the per-entity score with its special cases, and <code>macro_f05()</code> averages it over the full key set <code>tr1.entity_id</code>, never over the subset that received predictions. The stdlib scorer <code>utils/score.py</code> implements the same function for independent checking (Chapter 10).</p>
+  <p>Micro-level statistics such as total true positives are therefore only diagnostics: ten extra true pairs on one heavily linked entity raise the score far less than ten zero-scoring entities turned into correct singletons.</p>
+
+  <h3>2.3.3 The singleton rule</h3>
+  <p>When g(e) is empty, precision and recall are undefined, and the challenge fixes the score by rule: an empty prediction earns 1.0 and any non-empty prediction earns 0.0. Two further degenerate cases score 0.0: an empty prediction when the truth is non-empty, and a non-empty prediction with no correct identifier. <code>f05()</code> checks these three cases in that order before evaluating the formula. The rule has no middle ground: on a singleton, one spurious identifier costs the entire point, and on a single-match entity one missing identifier costs the entire point too. Whether to emit the first identifier is therefore a symmetric decision; the precision bias comes from the second and later identifiers, since adding one wrong identifier to a correct single match drops the score from 1.000 to 0.556, whereas missing a second true identifier drops it only to 0.833. The optimal threshold is consequently a property of the data (singleton fraction, true-set sizes, classifier calibration), which is why <code>main()</code> sweeps <code>thr</code> over 0.20 to 0.95 in steps of 0.025 and the relative ratio over {0, 0.6, 0.7, 0.8, 0.9, 1.0} on out-of-fold probabilities instead of assuming 0.5.</p>
+
+  <h3>2.3.4 Worked scenarios</h3>
+  <p>Table 2.2 evaluates the per-entity score for seven prediction outcomes, including the problem statement's example (two correct identifiers plus one wrong, 0.714). Scenarios 3 and 4 are the comparison to remember: one of two true matches with nothing wrong (0.833) beats both true matches with one false merge (0.714).</p>
+  <table class="tbl">
+    <caption>Table 2.2 — Per-entity F<sub>0.5</sub> for representative prediction scenarios</caption>
+    <thead><tr><th>#</th><th>Scenario</th><th>Truth g(e)</th><th>Prediction h(e)</th><th>tp / m / n</th><th>P</th><th>R</th><th>F<sub>0.5</sub>(e)</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>Correct singleton</td><td>{}</td><td>{}</td><td>— / 0 / 0</td><td>—</td><td>—</td><td>1.000 (rule)</td></tr>
+      <tr><td>2</td><td>False merge on singleton</td><td>{}</td><td>{S2-A}</td><td>0 / 1 / 0</td><td>—</td><td>—</td><td>0.000 (rule)</td></tr>
+      <tr><td>3</td><td>One of two found, nothing wrong</td><td>{S2-A, S3-B}</td><td>{S2-A}</td><td>1 / 1 / 2</td><td>1.000</td><td>0.500</td><td>0.833</td></tr>
+      <tr><td>4</td><td>Both found plus one wrong (statement example)</td><td>{S2-00047, S3-00812}</td><td>{S2-00047, S2-00193, S3-00812}</td><td>2 / 3 / 2</td><td>0.667</td><td>1.000</td><td>0.714</td></tr>
+      <tr><td>5</td><td>All predictions wrong</td><td>{S2-A, S3-B}</td><td>{S2-C}</td><td>0 / 1 / 2</td><td>0.000</td><td>0.000</td><td>0.000 (rule)</td></tr>
+      <tr><td>6</td><td>Empty prediction, truth non-empty</td><td>{S2-A}</td><td>{}</td><td>0 / 0 / 1</td><td>—</td><td>0.000</td><td>0.000 (rule)</td></tr>
+      <tr><td>7</td><td>Single match found plus one wrong</td><td>{S2-A}</td><td>{S2-A, S3-C}</td><td>1 / 2 / 1</td><td>0.500</td><td>1.000</td><td>0.556</td></tr>
+    </tbody>
+  </table>
+  <p>Figure 2.1 plots the per-entity score against precision for three fixed recall values. The curves are concave in P and their vertical spacing grows only slowly, the geometric statement that precision dominates: moving right along any curve gains more than moving up between curves.</p>
+  <figure>
+    <svg viewBox="0 0 800 420" width="100%" font-family="inherit" font-size="13" role="img" aria-label="F0.5 versus precision for three recall values">
+      <defs>
+        <marker id="ch02-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="#334155"/>
+        </marker>
+      </defs>
+      <rect x="80" y="30" width="680" height="330" fill="#f1f5f9" stroke="#334155" stroke-width="1"/>
+      <line x1="80" y1="294" x2="760" y2="294" stroke="#cbd5e1" stroke-width="1"/>
+      <line x1="80" y1="228" x2="760" y2="228" stroke="#cbd5e1" stroke-width="1"/>
+      <line x1="80" y1="162" x2="760" y2="162" stroke="#cbd5e1" stroke-width="1"/>
+      <line x1="80" y1="96" x2="760" y2="96" stroke="#cbd5e1" stroke-width="1"/>
+      <line x1="216" y1="30" x2="216" y2="360" stroke="#cbd5e1" stroke-width="1"/>
+      <line x1="352" y1="30" x2="352" y2="360" stroke="#cbd5e1" stroke-width="1"/>
+      <line x1="488" y1="30" x2="488" y2="360" stroke="#cbd5e1" stroke-width="1"/>
+      <line x1="624" y1="30" x2="624" y2="360" stroke="#cbd5e1" stroke-width="1"/>
+      <line x1="80" y1="360" x2="775" y2="360" stroke="#334155" stroke-width="1.5" marker-end="url(#ch02-arrow)"/>
+      <line x1="80" y1="360" x2="80" y2="15" stroke="#334155" stroke-width="1.5" marker-end="url(#ch02-arrow)"/>
+      <text x="76" y="364" text-anchor="end" fill="#0f172a">0.0</text>
+      <text x="76" y="298" text-anchor="end" fill="#0f172a">0.2</text>
+      <text x="76" y="232" text-anchor="end" fill="#0f172a">0.4</text>
+      <text x="76" y="166" text-anchor="end" fill="#0f172a">0.6</text>
+      <text x="76" y="100" text-anchor="end" fill="#0f172a">0.8</text>
+      <text x="76" y="34" text-anchor="end" fill="#0f172a">1.0</text>
+      <text x="216" y="378" text-anchor="middle" fill="#0f172a">0.2</text>
+      <text x="352" y="378" text-anchor="middle" fill="#0f172a">0.4</text>
+      <text x="488" y="378" text-anchor="middle" fill="#0f172a">0.6</text>
+      <text x="624" y="378" text-anchor="middle" fill="#0f172a">0.8</text>
+      <text x="760" y="378" text-anchor="middle" fill="#0f172a">1.0</text>
+      <text x="420" y="404" text-anchor="middle" fill="#0f172a">Precision P (per entity)</text>
+      <text x="22" y="195" text-anchor="middle" fill="#0f172a" transform="rotate(-90 22 195)">F0.5(e)</text>
+      <path d="M 80 360 L 148 320 L 216 282 L 284 245 L 352 210 L 420 177 L 488 145 L 556 114 L 624 85 L 692 57 L 760 30" fill="none" stroke="#334155" stroke-width="2.5"/>
+      <path d="M 80 360 L 148 321 L 216 285 L 284 252 L 352 223 L 420 195 L 488 170 L 556 146 L 624 124 L 692 104 L 760 85" fill="none" stroke="#334155" stroke-width="2" stroke-dasharray="8 5"/>
+      <path d="M 80 360 L 148 323 L 216 291 L 284 265 L 352 242 L 420 223 L 488 205 L 556 190 L 624 177 L 692 165 L 760 154" fill="none" stroke="#334155" stroke-width="2" stroke-dasharray="2 4"/>
+      <rect x="96" y="40" width="150" height="22" rx="6" fill="#dbeafe" stroke="#334155"/>
+      <text x="171" y="55" text-anchor="middle" fill="#0f172a">R = 1.0 (solid)</text>
+      <rect x="96" y="68" width="150" height="22" rx="6" fill="#dcfce7" stroke="#334155"/>
+      <text x="171" y="83" text-anchor="middle" fill="#0f172a">R = 0.5 (dashed)</text>
+      <rect x="96" y="96" width="150" height="22" rx="6" fill="#fef3c7" stroke="#334155"/>
+      <text x="171" y="111" text-anchor="middle" fill="#0f172a">R = 0.25 (dotted)</text>
+      <circle cx="534" cy="124" r="6" fill="#fee2e2" stroke="#334155" stroke-width="1.5"/>
+      <rect x="330" y="86" width="182" height="22" rx="6" fill="#fee2e2" stroke="#334155"/>
+      <text x="421" y="101" text-anchor="middle" fill="#0f172a">#4: P=0.67, R=1 → 0.714</text>
+      <line x1="512" y1="104" x2="529" y2="120" stroke="#334155" stroke-width="1"/>
+      <circle cx="760" cy="85" r="6" fill="#bfdbfe" stroke="#334155" stroke-width="1.5"/>
+      <rect x="578" y="196" width="176" height="22" rx="6" fill="#bfdbfe" stroke="#334155"/>
+      <text x="666" y="211" text-anchor="middle" fill="#0f172a">#3: P=1, R=0.5 → 0.833</text>
+      <line x1="740" y1="196" x2="758" y2="92" stroke="#334155" stroke-width="1"/>
+    </svg>
+    <figcaption>Figure 2.1 — Per-entity F<sub>0.5</sub> as a function of precision for recall fixed at 1.0, 0.5 and 0.25. The marked points are scenarios 4 and 3 of Table 2.2: perfect precision at half recall outscores perfect recall at two-thirds precision.</figcaption>
+  </figure>
+
+  <h2>2.4 Public and private leaderboards</h2>
+  <p>A submission always covers the full test set. During the challenge the public leaderboard scores an undisclosed subset of the test S1 entities; after the deadline the private leaderboard scores the remaining entities and alone determines the final ranking. Two consequences follow. First, the public score is a noisy estimate of the private one, so decisions are driven by the out-of-fold macro F<sub>0.5</sub> computed in <code>main()</code> on the training split, not by leaderboard probing. Second, the country mix of the two subsets is unknown, so the French share of the private set may differ from the public one; the per-country match-rate diagnostic printed at the end of <code>main()</code> exists to detect a French match rate that departs sharply from the US and Indian rates before submission (Chapter 10).</p>
+
+  <h2>2.5 Constraints</h2>
+  <dl>
+    <dt>No external lookup</dt>
+    <dd>External databases, entity-resolution APIs, government registries, geocoding services and internet-derived augmentation are prohibited on pain of disqualification. The pipeline reads only the seven TSV files located by <code>find_data_dir()</code>; its sole network action is the <code>pip install rapidfuzz</code> fallback on <code>ImportError</code>, which installs a library, not data (Chapter 13).</dd>
+    <dt>Model licence and size</dt>
+    <dd>The final model must carry an MIT or Apache-2.0 licence and have at most 8 billion parameters. The matcher is a LightGBM ensemble (MIT licence) whose parameters are split thresholds and leaf values: each cross-validation fold trains at most 2,000 rounds of 63-leaf trees (<code>num_leaves=63</code>) with early stopping after 100 rounds without improvement, and the final model is refitted for 1.1 times the mean best iteration of the folds. Even at the cap this is a few hundred thousand values, orders of magnitude below the limit.</dd>
+    <dt>Format validity</dt>
+    <dd>A submission that fails validation is not scored. The rules require exactly one row per test S1 entity, no duplicate rows, no duplicate identifiers within a list, S2/S3 prefixes only, and identifiers that exist in the test set. <code>utils/validate_submission.py</code> mirrors these checks locally and additionally rejects quote characters, empty or whitespace-padded list tokens, rows with other than two tab-separated columns, and, when <code>--candidate</code> is given, any matched identifier absent from the candidate list. It prints <code>PASS</code> and exits 0 only when no issue is found.</dd>
+    <dt>Open-set country</dt>
+    <dd>The country column must be treated as an unbounded set of string labels; France appears only at test time.</dd>
+    <dt>Reproducibility</dt>
+    <dd>The final package must regenerate both output files from the raw data using only the code under <code>code/business_entity_resolution/</code> with pinned dependencies.</dd>
+  </dl>
+
+  <h2>2.6 Implications of the metric for each pipeline stage</h2>
+  <p>Table 2.3 records, for every pipeline stage, the property of the metric or rules that shapes it and the mechanism in the code that responds; it is the bridge to the design chapters that follow.</p>
+  <table class="tbl">
+    <caption>Table 2.3 — Consequences of the metric and rules for each pipeline stage</caption>
+    <thead><tr><th>Stage (chapter)</th><th>Metric or rule property</th><th>Consequence and implementing mechanism</th></tr></thead>
+    <tbody>
+      <tr><td>Normalisation (5)</td><td>Open-set country; precision weighting</td><td>Language-neutral folding in <code>basic()</code> and legal-form lists that already include French forms in <code>LEGAL</code>, so French names are comparable without training data. Postal and house numbers are extracted in <code>prep()</code> as explicit disagreement evidence, which the model needs to reject near-duplicates rather than merely to find matches.</td></tr>
+      <tr><td>Blocking (6)</td><td>Macro-average: an entity with no blocked true pair scores 0</td><td>Recall is measured per S1 entity, not per pair: <code>main()</code> logs the number of S1 entities with at least one true candidate and the blocking-oracle score. Four unioned views in <code>block()</code> raise entity-level recall; the 0.05 cosine floor limits noise because every candidate is a potential false merge.</td></tr>
+      <tr><td>Pair features (7)</td><td>False merges cost more than misses</td><td>Conflict signals (<code>postal_state</code>, <code>house_state</code>, <code>num_conflict</code>) and contextual gap and rank features in <code>features()</code> let the model distinguish the best candidate from a look-alike, which is where false merges originate.</td></tr>
+      <tr><td>Matcher (8)</td><td>Licence and size limits; honest probabilities needed for thresholding</td><td>LightGBM (MIT, far below 8B parameters) trained with GroupKFold grouped by S1 so out-of-fold probabilities come from unseen entities.</td></tr>
+      <tr><td>Decision (9)</td><td>Singleton rule; each wrong identifier adds a full unit to the denominator</td><td><code>decode_table()</code> assigns each S2/S3 record to a single S1; <code>decide()</code> applies an absolute threshold and a relative ratio; both parameters are chosen by maximising <code>macro_f05()</code> over all entities, singletons included.</td></tr>
+      <tr><td>Validation (10)</td><td>Macro-average; public/private split</td><td>Out-of-fold macro F<sub>0.5</sub> is the selection criterion; per-country and per-size breakdowns from <code>utils/score.py</code> reveal whether gains come from singletons or from multi-match entities.</td></tr>
+      <tr><td>Outputs (11)</td><td>Format rejection means score 0; matches must be a subset of candidates</td><td>One row per test entity in file order, de-duplicated lists, both files generated from the same candidate table, validated with <code>utils/validate_submission.py</code> before upload.</td></tr>
+    </tbody>
+  </table>
+  <aside class="warn"><strong>Risk.</strong> Data-dependent quantities (singleton fraction, selected threshold, out-of-fold score) appear in Chapters 10 and 12 as "to be filled from the run log"; the pipeline has not yet been executed on the released data and no such number is estimated in this chapter.</aside>
+</section>

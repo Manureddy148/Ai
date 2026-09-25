@@ -1,0 +1,145 @@
+<section class="chapter" id="ch-08">
+  <h1><span class="num">8</span> Matching Model: LightGBM Classifier</h1>
+  <p class="lead">This chapter describes the supervised matcher that turns the 38-column feature row of Chapter 7 into a match probability for every candidate pair: a single LightGBM gradient-boosted tree ensemble with a binary log-loss objective, trained inside <code>main()</code> on the blocked training pairs, validated with a five-fold <code>GroupKFold</code> grouped by Source 1 record, and refitted on all pairs before scoring the test set. The model never decides anything itself; it emits calibrated probabilities, and every decision the precision-weighted F<sub>0.5</sub> metric depends on is deferred to the threshold and relative-ratio rule of Chapter 9. The chapter covers the choice of trees, the hyperparameters, label construction, grouped out-of-fold (OOF) validation, early stopping and refit, gain importances, and the interface a replacement model must honour.</p>
+
+  <h2>8.1 Why gradient-boosted trees for pairwise entity resolution</h2>
+  <p>A pairwise matcher receives one row per (S1, S2/S3) candidate pair and outputs the probability that the two records describe the same business. The feature row of Chapter 7 is heterogeneous by design: rapidfuzz scores on 0-100, TF-IDF cosines on 0-1, Jaccard indices, character lengths, integer ranks and counts, binary flags such as <code>n_acronym</code>, and ternary agreement states (<code>postal_state</code>, <code>house_state</code>) whose values 1, 0 and −1 mean "agree", "unknown" and "conflict". A gradient-boosted decision tree (GBDT) ensemble consumes such a mix without scaling, one-hot encoding or imputation, because every split is a threshold on one raw column.</p>
+  <p>The decisions that matter for the metric are interactions, not marginal effects. A moderate name score (<code>n_tset</code> around 70) is strong evidence when <code>postal_state = 1</code> and <code>num_conflict = 0</code>, and weak evidence when <code>postal_state = −1</code>; a negative <code>cos_full_gap1</code> changes the meaning of every absolute similarity, since a pair dominated by a competitor of the same S1 record is far more often a near-duplicate of a different business than a second true record. Trees express such conditional rules natively; a linear model needs hand-built cross terms. Because F<sub>0.5</sub> weights precision twice as heavily as recall and a singleton scores 1.0 only with an empty prediction (see Chapter 2), the matcher must separate "similar but wrong" from "similar and right", a separation carried by conflicts and context interactions.</p>
+  <p>The remaining reasons are practical. Positives are a small minority of the blocked pairs (the measured rate is recorded in Table 8.3), so a model that converges in a few hundred trees on CPU (<code>n_jobs=-1</code>) is preferable to one needing GPU epochs. LightGBM is MIT-licensed, and at most 2,000 trees of 63 leaves amount to on the order of 10<sup>5</sup> split thresholds and leaf values, negligible against the 8B parameter cap (see Chapter 13). Its per-feature gain also keeps the feature layer auditable when a rule of Chapter 5 changes.</p>
+
+  <h2>8.2 Hyperparameters</h2>
+  <p>The parameters are set once, in the <code>params</code> dictionary of <code>main()</code>, and shared by the five cross-validation fits and the final refit. Table 8.1 lists each with its role. They are conservative defaults for a tabular binary classifier of this size, not values tuned on the released data.</p>
+  <table class="tbl">
+    <caption>Table 8.1 — LightGBM hyperparameters in <code>params</code> and the rationale for each value</caption>
+    <thead><tr><th>Parameter</th><th>Value</th><th>Role and rationale</th></tr></thead>
+    <tbody>
+      <tr><td><code>objective</code></td><td><code>binary</code></td><td>Log-loss on y ∈ {0, 1}; the leaf outputs are log-odds, so <code>predict()</code> returns a calibrated probability that the threshold sweep of Chapter 9 can act on.</td></tr>
+      <tr><td><code>learning_rate</code></td><td>0.05</td><td>Shrinkage per tree. Small enough that early stopping lands on a smooth loss minimum rather than oscillating between rounds; combined with the 2,000-round cap it leaves ample capacity.</td></tr>
+      <tr><td><code>num_leaves</code></td><td>63</td><td>Maximum leaves per tree (leaf-wise growth). 63 allows a tree to express a six-way interaction such as name score × postal state × number conflict × gap, which is the depth the data noise demands.</td></tr>
+      <tr><td><code>min_child_samples</code></td><td>40</td><td>Minimum pairs in a leaf. Prevents leaves that memorise a single S1 record's candidate set; with positives being rare this also stops a leaf from being carved around a handful of positives.</td></tr>
+      <tr><td><code>feature_fraction</code></td><td>0.8</td><td>Each tree sees a random 80% of the 38 columns, decorrelating trees and forcing the ensemble to use secondary evidence (address, alias, acronym features) instead of leaning only on <code>cos_full</code>.</td></tr>
+      <tr><td><code>bagging_fraction</code> / <code>bagging_freq</code></td><td>0.8 / 1</td><td>Each tree is fitted on a fresh random 80% of the rows (resampled every round). Reduces variance on the rare positive class.</td></tr>
+      <tr><td><code>lambda_l2</code></td><td>1.0</td><td>L2 penalty on leaf values; damps extreme log-odds on small leaves so that probabilities near the tuned threshold remain smooth.</td></tr>
+      <tr><td><code>verbose</code> / <code>n_jobs</code></td><td>−1 / −1</td><td>Silent training; all CPU cores.</td></tr>
+      <tr><td>rounds / patience</td><td>2000 / 100</td><td>Passed to <code>lgb.train()</code> and <code>lgb.early_stopping()</code>, not to <code>params</code>; see Section 8.5.</td></tr>
+    </tbody>
+  </table>
+  <p>No <code>seed</code> is fixed, so bagging and feature subsampling make consecutive runs differ in the last decimals of the probabilities; adding <code>seed</code> (together with <code>deterministic=True</code> and a fixed thread count, since <code>n_jobs=-1</code> leaves histogram construction order to the scheduler) to <code>params</code> makes runs reproducible (see Chapter 11).</p>
+
+  <h2>8.3 Label construction and class balance</h2>
+  <p>Labels exist only for the training split and come from the ground truth loaded by <code>load_split()</code>, which maps each S1 <code>entity_id</code> to its set of matched S2/S3 ids. After blocking and feature computation, <code>main()</code> sets y = 1 for a candidate row if and only if the S2/S3 id belongs to the ground-truth set of its S1 id:</p>
+  <pre><code>ftr["y"] = [int(id2[b] in gt.get(id1[a], ()))
+            for a, b in zip(ftr.i1.values, ftr.i2.values)]</code></pre>
+  <p>Two consequences follow. The model is trained only on pairs that blocking produced: a true pair no view retrieved is neither positive nor negative, and its loss is charged to the blocking recall ceiling of Chapter 6. And the negatives are the hard negatives blocking found plausible, exactly the distribution met at test time.</p>
+  <p>The classes are imbalanced: <code>block()</code> can attach up to 25 + 25 + 10 + 10 = 70 candidates to one S1 record before de-duplication (the union of four top-k views, Chapter 6), whereas the ground truth lists zero, one or a few matches per record, so positives are a small minority; the exact positive rate is a run-log quantity (Table 8.3). The pipeline deliberately applies no reweighting, neither <code>is_unbalance</code>, <code>scale_pos_weight</code> nor sample weights. Reweighting shifts the probability scale, and the decision layer of Chapter 9 never uses 0.5 as a boundary; it sweeps the absolute threshold from 0.20 to 0.95 and a relative ratio directly on the OOF macro F<sub>0.5</sub>. What the sweep needs is a well-ordered, calibrated probability, which unweighted log-loss provides; reweighting would instead inflate probabilities on ambiguous pairs, the opposite of what a precision-weighted metric with an all-or-nothing singleton term rewards.</p>
+
+  <h2>8.4 Grouped cross-validation and out-of-fold assembly</h2>
+  <p>The held-out probabilities estimate the leaderboard score and are the data on which the threshold and ratio are selected, so validation rows must come from S1 records the model never saw. A plain random split violates this: the candidates of one S1 record would be scattered across folds, so the model would predict one of them having learned the others. The context features of Chapter 7 make the leak worse, since <code>cos_full_gap1</code>, <code>rank1</code> and <code>n_cand1</code> encode the whole candidate set of a record.</p>
+  <p><code>main()</code> therefore uses <code>GroupKFold(args.folds)</code>, five folds by default, with <code>groups=ftr.i1</code>: every candidate of an S1 record, and hence every positive and negative competing for it, lands in the same fold. Because the decode of Chapter 9 operates per S1 record, the fold structure also makes the OOF macro F<sub>0.5</sub> a proper per-entity estimate, including singleton records, which contribute only negatives and are the entities most exposed to a false positive. Figure 8.1 shows the mechanism.</p>
+  <figure>
+    <svg viewBox="0 0 800 440" width="100%" font-family="inherit" font-size="13" fill="#0f172a">
+      <defs>
+        <marker id="ch08-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="#334155"/>
+        </marker>
+      </defs>
+      <text x="20" y="28" font-weight="bold">ftr: candidate rows, grouped by i1 (all pairs of one S1 stay together)</text>
+      <rect x="20" y="40" width="148" height="46" rx="6" fill="#dbeafe" stroke="#334155"/>
+      <text x="30" y="60">S1-A: 3 pairs</text><text x="30" y="78">y = 1,0,0</text>
+      <rect x="176" y="40" width="148" height="46" rx="6" fill="#dbeafe" stroke="#334155"/>
+      <text x="186" y="60">S1-B: 2 pairs</text><text x="186" y="78">y = 0,0 (singleton)</text>
+      <rect x="332" y="40" width="148" height="46" rx="6" fill="#dbeafe" stroke="#334155"/>
+      <text x="342" y="60">S1-C: 4 pairs</text><text x="342" y="78">y = 1,1,0,0</text>
+      <rect x="488" y="40" width="148" height="46" rx="6" fill="#dbeafe" stroke="#334155"/>
+      <text x="498" y="60">S1-D: 3 pairs</text><text x="498" y="78">y = 0,0,0</text>
+      <rect x="644" y="40" width="136" height="46" rx="6" fill="#dbeafe" stroke="#334155"/>
+      <text x="654" y="60">... S1-N</text><text x="654" y="78">groups = ftr.i1</text>
+      <line x1="400" y1="86" x2="400" y2="118" stroke="#334155" stroke-width="1.5" marker-end="url(#ch08-arrow)"/>
+      <text x="410" y="108">GroupKFold(5).split(ftr, groups=ftr.i1)</text>
+      <!-- fold rows -->
+      <text x="20" y="140" font-weight="bold">fold k</text>
+      <text x="120" y="140" font-weight="bold">train (a)</text>
+      <text x="470" y="140" font-weight="bold">held out (b)</text>
+      <text x="640" y="140" font-weight="bold">result</text>
+      <!-- fold 0 -->
+      <text x="20" y="170">k = 0</text>
+      <rect x="120" y="152" width="330" height="28" rx="6" fill="#dcfce7" stroke="#334155"/>
+      <text x="130" y="171">lgb.train(params, 2000 rounds, early_stopping(100))</text>
+      <rect x="470" y="152" width="150" height="28" rx="6" fill="#fef3c7" stroke="#334155"/>
+      <text x="480" y="171">groups of fold 0</text>
+      <rect x="640" y="152" width="140" height="28" rx="6" fill="#e2e8f0" stroke="#334155"/>
+      <text x="650" y="171">oof[b], iters[0]</text>
+      <!-- fold 1 -->
+      <text x="20" y="212">k = 1</text>
+      <rect x="120" y="194" width="330" height="28" rx="6" fill="#dcfce7" stroke="#334155"/>
+      <text x="130" y="213">4/5 of the S1 groups</text>
+      <rect x="470" y="194" width="150" height="28" rx="6" fill="#fef3c7" stroke="#334155"/>
+      <text x="480" y="213">groups of fold 1</text>
+      <rect x="640" y="194" width="140" height="28" rx="6" fill="#e2e8f0" stroke="#334155"/>
+      <text x="650" y="213">oof[b], iters[1]</text>
+      <!-- fold 2..4 -->
+      <text x="20" y="254">k = 2..4</text>
+      <rect x="120" y="236" width="330" height="28" rx="6" fill="#dcfce7" stroke="#334155" stroke-dasharray="4 3"/>
+      <text x="130" y="255">same, rotating the held-out fifth</text>
+      <rect x="470" y="236" width="150" height="28" rx="6" fill="#fef3c7" stroke="#334155" stroke-dasharray="4 3"/>
+      <text x="480" y="255">fold 2 / 3 / 4</text>
+      <rect x="640" y="236" width="140" height="28" rx="6" fill="#e2e8f0" stroke="#334155" stroke-dasharray="4 3"/>
+      <text x="650" y="255">oof[b], iters[k]</text>
+      <!-- assembly -->
+      <line x1="710" y1="264" x2="710" y2="300" stroke="#334155" stroke-width="1.5" marker-end="url(#ch08-arrow)"/>
+      <rect x="20" y="304" width="480" height="52" rx="6" fill="#cbd5e1" stroke="#334155"/>
+      <text x="30" y="325" font-weight="bold">oof: one probability per row of ftr, every row scored by a model that</text>
+      <text x="30" y="345">never saw its S1 record  ->  decode_table(ftr, oof)  ->  (thr, ratio) sweep, Chapter 9</text>
+      <rect x="520" y="304" width="260" height="52" rx="6" fill="#cbd5e1" stroke="#334155"/>
+      <text x="530" y="325" font-weight="bold">iters = [best_iteration x 5]</text>
+      <text x="530" y="345">n_refit = int(mean(iters) * 1.1)</text>
+      <line x1="650" y1="356" x2="650" y2="388" stroke="#334155" stroke-width="1.5" marker-end="url(#ch08-arrow)"/>
+      <rect x="380" y="392" width="400" height="36" rx="6" fill="#fee2e2" stroke="#334155"/>
+      <text x="390" y="415">model = lgb.train(params, Dataset(ftr[feats], y), n_refit)  ->  test</text>
+    </svg>
+    <figcaption>Figure 8.1 — GroupKFold out-of-fold scheme in <code>main()</code>. Rows are grouped by <code>i1</code>, each fold trains on four fifths of the S1 groups with early stopping on the fifth, the held-out predictions fill <code>oof</code>, the five best iterations set the refit length, and the refit model scores the test pairs.</figcaption>
+  </figure>
+  <p>Each fold calls <code>lgb.train()</code> with a training <code>lgb.Dataset</code> on <code>ftr.iloc[a][feats]</code> and a validation set on <code>ftr.iloc[b][feats]</code>. The held-out slice is scored with <code>m.predict(..., num_iteration=m.best_iteration)</code> and written into <code>oof[b]</code>; the five index sets <code>b</code> partition the rows, so <code>oof</code> ends as a full-length vector aligned with <code>ftr</code>, which <code>decode_table()</code> consumes. Context features grouped by <code>i2</code> (<code>cos_full_gap2</code>, <code>rank2</code>, <code>n_cand2</code>) do span folds, but they derive from unsupervised similarities only and carry no label information.</p>
+
+  <h2>8.5 Early stopping, best iteration and the refit</h2>
+  <p>Each fold trains for at most 2,000 boosting rounds under <code>lgb.early_stopping(100, verbose=False)</code>, which monitors the validation binary log-loss and halts once it has not improved for 100 consecutive rounds; <code>m.best_iteration</code> is the round with the lowest validation loss, used by <code>predict()</code> for the OOF slice, appended to <code>iters</code> and printed as <code>fold k: best_iter=…</code>. Log-loss rather than the competition metric is monitored on purpose: the metric depends on a threshold not yet chosen, whereas log-loss selects the round at which probabilities are best calibrated across the range the sweep explores.</p>
+  <p>After the sweep, the final model is refitted once on every training pair with a fixed <code>int(np.mean(iters) * 1.1)</code> rounds. No held-out data remain, so early stopping is unavailable and the length is transferred from cross-validation: the mean best iteration, scaled by 1.1 because a model fitted on all groups rather than four fifths benefits from slightly more rounds, truncated to an integer. The refit reuses <code>params</code>, so the probability scale on which <code>best_thr</code> and <code>best_ratio</code> were selected is preserved as closely as a refit permits. Test pairs are scored with <code>model.predict(fte[feats])</code>, where <code>fte</code> comes from the same <code>block()</code> and <code>features()</code> path (see Chapter 4).</p>
+  <aside class="warn"><strong>Risk.</strong> The threshold and ratio are selected on the same OOF probabilities that report the validation score, over 31 × 6 = 186 configurations, so the printed OOF macro F<sub>0.5</sub> is mildly optimistic; Chapter 10 discusses a nested check. Separately, the refit model has seen no French record and trees cannot extrapolate beyond the training value ranges; the bounded similarities of Chapter 7 limit this exposure, and the per-country match-rate log line for the test split is the only in-pipeline signal for it.</aside>
+
+  <h2>8.6 Reading the gain importances</h2>
+  <p>After the refit, <code>main()</code> computes <code>model.feature_importance("gain")</code>, indexes it by <code>feats</code>, sorts it descending and prints the top 15. Gain is the total reduction of the training objective attributed to splits on a feature, summed over all trees; it has no sign and is not a coefficient. Three readings are useful. High gain for <code>cos_full</code>, <code>n_tset</code> or <code>cos_full_gap1</code> confirms that name similarity and its context dominate. Gain on the ternary and conflict features (<code>postal_state</code>, <code>house_state</code>, <code>num_conflict</code>) shows the model separating near-duplicates by address evidence, where precision is won. Near-zero gain, for instance on <code>n_acronym</code> or <code>has_alias</code>, means the feature is rare or absorbed by another; it is a removal candidate only once the OOF score is shown not to move. Measured values belong in Table 8.3 (Section 8.8).</p>
+
+  <h2>8.7 Model interface and how to swap the model</h2>
+  <p>The matcher is coupled to the pipeline through the narrow contract of Table 8.2. Any model that fits on <code>ftr[feats]</code> with labels <code>ftr.y</code>, respects the grouped fold indices and returns one probability per row can replace LightGBM without touching blocking, features or the decision layer, provided OOF and test predictions share one scale, since <code>best_thr</code> and <code>best_ratio</code> are selected on the former and applied to the latter.</p>
+  <table class="tbl">
+    <caption>Table 8.2 — Model interface contract as used by <code>main()</code>; a replacement must satisfy every row</caption>
+    <thead><tr><th>Aspect</th><th>Contract</th><th>Where it is consumed</th></tr></thead>
+    <tbody>
+      <tr><td>Training input</td><td><code>ftr[feats]</code>, a DataFrame of 38 numeric columns (all columns except <code>i1</code>, <code>i2</code>, <code>y</code>), no NaN; label <code>ftr.y</code> ∈ {0, 1}</td><td><code>lgb.Dataset</code> in the fold loop and the refit</td></tr>
+      <tr><td>Fold protocol</td><td>Fit on index set <code>a</code>, predict index set <code>b</code>, for the five <code>GroupKFold</code> splits grouped by <code>i1</code>; write predictions into <code>oof[b]</code></td><td><code>decode_table(ftr, oof)</code>, sweep of Chapter 9</td></tr>
+      <tr><td>Capacity transfer</td><td>Expose a per-fold capacity value (here <code>best_iteration</code>) so the refit can be sized as 1.1 × mean; a model without early stopping may fix its capacity and skip this</td><td><code>iters</code>, refit call</td></tr>
+      <tr><td>Output</td><td><code>predict(X)</code> returns a float array of length len(X) in [0, 1], row-aligned with X, monotone in match confidence and on one scale across S1 groups (the ratio rule compares probabilities within a group)</td><td><code>decode_table()</code>, <code>decide()</code></td></tr>
+      <tr><td>Test scoring</td><td>Same <code>predict()</code> on <code>fte[feats]</code> from the refit model; no test labels, no external data</td><td><code>matches</code>, <code>matching_results.tsv</code></td></tr>
+      <tr><td>Introspection (optional)</td><td>Per-feature importance for the top-15 log</td><td>diagnostics only</td></tr>
+      <tr><td>Constraints</td><td>MIT or Apache-2.0 licence, ≤ 8B parameters, CPU-feasible on the candidate count, no lookups</td><td>Chapter 13</td></tr>
+    </tbody>
+  </table>
+  <p>A swap replaces the two <code>lgb.train()</code> calls and the two <code>predict()</code> calls; the fold loop, the <code>oof</code> assembly, the sweep and the output writers remain. A model emitting unbounded scores must first map them into [0, 1], by a sigmoid or a rank normalisation over all pairs, because the 0.20-0.95 sweep grid assumes that range.</p>
+  <aside class="note"><strong>Design note. Alternatives considered.</strong> A logistic regression on the same 38 features is the fastest option and is well calibrated, but it is additive: it cannot express that <code>postal_state = −1</code> reverses the meaning of a high <code>n_tset</code> unless cross terms and one-hot encodings of the ternary states are added by hand, which costs precision at the singleton-heavy operating point. A pairwise transformer cross-encoder, for instance a DistilBERT-class (Apache-2.0) or MiniLM-class (MIT) multilingual encoder with tens to a few hundred million parameters (far below the 8B cap), fine-tuned on the concatenated "name | address" strings of the blocked training pairs, would learn abbreviations and idioms the tables of Chapter 5 miss and would likely transfer better to French text, at the cost of a GPU for fine-tuning and for scoring every blocked pair, an opaque error profile, and the loss of the context features unless re-attached. The pragmatic combination, noted in Chapter 14, keeps LightGBM as the decision model and feeds it a cross-encoder score as one more column, or re-ranks only pairs near the tuned threshold, so the calibrated, auditable tree model remains the interface to Chapter 9.</aside>
+
+  <h2>8.8 Quantities recorded from the run</h2>
+  <p>Table 8.3 collects the training-time quantities the matcher prints. None is estimated here; the pipeline has not yet been executed on the released data, and each cell is filled from the run log (see Chapter 10).</p>
+  <table class="tbl">
+    <caption>Table 8.3 — Training quantities produced by the matcher; measured values to be filled from the run log (the pipeline has not yet been executed on the released data)</caption>
+    <thead><tr><th>Quantity</th><th>Log line / source</th><th>Measured</th></tr></thead>
+    <tbody>
+      <tr><td>Training pairs and positives</td><td><code>blocking recall ceiling</code> line (pos / true)</td><td>to be filled from the run log</td></tr>
+      <tr><td>Positive rate</td><td>pos / |ftr|</td><td>to be filled from the run log</td></tr>
+      <tr><td>Best iteration per fold (k = 0…4)</td><td><code>fold k: best_iter=</code></td><td>to be filled from the run log</td></tr>
+      <tr><td>Refit rounds, int(1.1 × mean)</td><td>derived from the five values above</td><td>to be filled from the run log</td></tr>
+      <tr><td>OOF macro F<sub>0.5</sub>, selected thr and ratio</td><td><code>OOF macro F0.5 = … at thr=… ratio=…</code></td><td>to be filled from the run log</td></tr>
+      <tr><td>Top-15 features by gain</td><td>printed after the refit</td><td>to be filled from the run log</td></tr>
+      <tr><td>Training wall time of the five folds and refit</td><td>timestamps of the log lines</td><td>to be filled from the run log</td></tr>
+    </tbody>
+  </table>
+</section>
