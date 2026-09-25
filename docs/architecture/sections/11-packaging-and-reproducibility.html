@@ -1,0 +1,175 @@
+<section class="chapter" id="ch-11">
+  <h1><span class="num">11</span> Outputs, Packaging and Reproducibility</h1>
+  <p class="lead">The pipeline ends where the organisers' tooling begins: two tab-separated files, a zip archive with a fixed layout, and the claim that anyone can regenerate the files from the training and test data alone. This chapter documents the writer loop in <code>main()</code>, the invariants that make both files pass validation by construction, the repository and package layout, the Kaggle notebook cell by cell with its dataset mirrors, and the sources of non-determinism a bit-exact re-run must control. Numbers that come from an actual run are marked as placeholders; nothing measured is reported.</p>
+
+  <h2>11.1 The output files</h2>
+  <h3>11.1.1 The writer code path</h3>
+  <p>Both files are written by one loop at the end of <code>main()</code>, after <code>decide()</code> has selected the test pairs (see Chapter 9). Its inputs are two dictionaries built by <code>to_lists()</code>: <code>matches</code>, from the decoded pairs, and <code>cands</code>, from <code>fte[["i1", "i2"]]</code>, the full test feature table. <code>to_lists()</code> starts from <code>{e: [] for e in s1.entity_id}</code>, so every test S1 entity owns a key before any pair is appended; an entity with no surviving pair, or no candidate at all, keeps an empty list instead of vanishing from the output.</p>
+  <pre><code>for fname, col, lists in [("matching_results.tsv", "matched_entity_ids", matches),
+                          ("candidate_pairs.tsv", "candidate_entity_ids", cands)]:
+    path = os.path.join(args.out_dir, fname)
+    with open(path, "w", newline="") as fh:
+        fh.write(f"source1_entity_id\t{col}\n")
+        for e in te1.entity_id.values:
+            fh.write(f"{e}\t{','.join(dict.fromkeys(lists[e]))}\n")
+    log(f"wrote {path}")</code></pre>
+  <p>Four details carry the format guarantees. The header is a literal f-string with one tab, so the column names are exactly those of the specification; nothing is delegated to <code>DataFrame.to_csv()</code>, whose index, quoting and line-terminator defaults would each need overriding. Rows follow <code>te1.entity_id.values</code>, the S1 test frame after <code>prep()</code>, which calls <code>reset_index(drop=True)</code> but never reorders, so output order and row count equal those of <code>test_source1.tsv</code>. Each list passes through <code>dict.fromkeys()</code>, which keeps insertion order and collapses repeated keys, before the comma join. The file is opened with <code>newline=""</code>, which disables platform newline translation, so the explicit <code>\n</code> is written verbatim and a Windows run cannot glue a carriage return to the last id of a row.</p>
+  <p>Duplicates inside a list are already impossible upstream: <code>block()</code> ends with <code>drop_duplicates()</code> on <code>(i1, i2)</code> and <code>decode_table()</code> keeps each S2/S3 row for one S1 only, so <code>dict.fromkeys()</code> is a guard, not a repair. An empty list joins to the empty string, so a singleton row is the id, a tab and a newline, exactly the third example row of the problem statement.</p>
+
+  <h3>11.1.2 Row invariants and schema</h3>
+  <p>Table 11.1 lists the rules the official validator enforces (see Chapter 10 for <code>validate_submission.py</code>, which mirrors them) and the construct that satisfies each. Entity ids are copied unchanged from frames that <code>read_tsv()</code> loads with <code>dtype=str</code>, <code>keep_default_na=False</code> and <code>quoting=3</code>, so an id is never coerced to a number, never becomes <code>NaN</code>, and never has quotation characters added or stripped.</p>
+  <table class="tbl">
+    <caption>Table 11.1 — Output file schema and format rules, with the construct that guarantees each.</caption>
+    <thead><tr><th>Rule (problem statement)</th><th>matching_results.tsv</th><th>candidate_pairs.tsv</th><th>Guaranteed by</th></tr></thead>
+    <tbody>
+      <tr><td>Header, tab-separated</td><td><code>source1_entity_id&#9;matched_entity_ids</code></td><td><code>source1_entity_id&#9;candidate_entity_ids</code></td><td>literal header f-string in the writer loop</td></tr>
+      <tr><td>Exactly one row per test S1 entity</td><td colspan="2">rows follow <code>te1.entity_id.values</code>, in <code>test_source1.tsv</code> order</td><td>iteration over the S1 frame; <code>to_lists()</code> pre-seeds every id</td></tr>
+      <tr><td>Empty list for singletons / no candidates</td><td><code>S1-00003&#9;</code></td><td><code>S1-00003&#9;</code></td><td><code>",".join([])</code> is the empty string</td></tr>
+      <tr><td>No duplicate ids within a list</td><td colspan="2">comma-joined, insertion order kept</td><td><code>dict.fromkeys()</code>; upstream <code>drop_duplicates()</code></td></tr>
+      <tr><td>Only S2-/S3- ids that exist in the test set</td><td colspan="2">ids come from <code>other.entity_id.values</code>, the concatenation of <code>test_source2.tsv</code> and <code>test_source3.tsv</code></td><td>index-to-id mapping in <code>to_lists()</code></td></tr>
+      <tr><td>No quoting characters</td><td colspan="2">ids written verbatim; commas and tabs never appear inside an id</td><td><code>quoting=3</code> on read, manual write</td></tr>
+      <tr><td>Matches are a subset of candidates</td><td>decoded pairs</td><td>every scored pair</td><td><code>decide()</code> filters rows of <code>decode_table(fte, pte)</code></td></tr>
+      <tr><td>Line terminator</td><td colspan="2">LF only, on every platform</td><td><code>open(..., newline="")</code> and explicit <code>\n</code></td></tr>
+    </tbody>
+  </table>
+
+  <h2>11.2 candidate_pairs.tsv: the set the model scores</h2>
+  <p>The problem statement defines <code>candidate_pairs.tsv</code> as the exact set of records fed to the matching model for inference, not the output of an early blocking pass that is later filtered. The pipeline meets this definition literally. <code>cte = block(te1, te2)</code> is the only candidate-generation stage; <code>fte = features(cte, te1, te2)</code> starts from <code>cand.copy()</code> and only assigns columns, so it neither adds nor removes rows; <code>pte = model.predict(fte[feats])</code> scores every row; and <code>cands = to_lists(fte[["i1", "i2"]], te1, te2)</code> converts the same rows to id lists. The organisers' recall-ceiling and reduction-ratio analysis of this file therefore describes precisely what the LightGBM model saw.</p>
+  <p>The subset property follows from the same flow. <code>decode_table(fte, pte)</code> takes <code>fte[["i1", "i2", "is_s3"]]</code>, attaches probabilities and drops rows via <code>drop_duplicates("i2")</code>, but never creates any; <code>decide()</code> is a boolean mask over that table. Every row of <code>matches</code> is thus a row of <code>fte</code>, and the validator's cross-check can fail only when the two files come from different invocations.</p>
+  <aside class="note"><strong>Design note.</strong> The candidate file is much larger than the match file: each S1 entity carries up to 25 + 25 + 10 + 10 = 70 candidates before the per-view <code>sc &gt; 0.05</code> cosine cut and the de-duplication of the union (see Chapter 6), against the few that survive <code>decide()</code>. Because F<sub>0.5</sub> is precision-weighted and a singleton scores 1.0 only when predicted empty, the gap between the files is the visible record of how much the matcher and decision layer remove.</aside>
+
+  <h2>11.3 Repository layout and the submission package</h2>
+  <p>The repository keeps the pipeline in the layout the challenge prescribes for the zip, so packaging is a copy rather than a restructuring. <code>code/business_entity_resolution/</code> holds <code>src/er_pipeline.py</code>, the pipeline <code>README.md</code> and <code>requirements.txt</code>; <code>Documentation_template.md</code> at the root is the methodology write-up; <code>utils/</code> contains the stdlib-only validator and scorer plus a synthetic-data generator; <code>notebooks/kaggle_run.ipynb</code> is the runner of Section 11.4; <code>docs/</code> carries this document; <code>output/</code> receives the generated TSVs. The dataset, zip archives and <code>output/*.tsv</code> are excluded by <code>.gitignore</code>.</p>
+  <p>The archive is <code>&lt;team_name&gt;_submission.zip</code> with the structure of Figure 11.1: the two output files, the self-contained code folder and the methodology document, nothing else. The organisers use it to reproduce results, audit blocking and check fair play and licensing (see Chapter 13), so the code folder must run alone: <code>er_pipeline.py</code> imports, beyond the standard library, only NumPy, pandas, scikit-learn, LightGBM and rapidfuzz (SciPy is used indirectly through the sparse TF-IDF matrices), and installs rapidfuzz through <code>pip</code> when its import fails.</p>
+  <figure>
+    <svg viewBox="0 0 800 470" width="100%" font-family="inherit" font-size="13" fill="#0f172a">
+      <defs>
+        <marker id="ch11-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="#334155"/>
+        </marker>
+      </defs>
+      <!-- root -->
+      <rect x="20" y="16" width="260" height="32" rx="6" fill="#cbd5e1" stroke="#334155"/>
+      <text x="32" y="37" font-weight="bold">&lt;team_name&gt;_submission.zip</text>
+      <line x1="40" y1="48" x2="40" y2="426" stroke="#334155" stroke-width="1.5"/>
+      <!-- output/ -->
+      <line x1="40" y1="82" x2="70" y2="82" stroke="#334155" stroke-width="1.5"/>
+      <rect x="70" y="66" width="200" height="32" rx="6" fill="#dbeafe" stroke="#334155"/>
+      <text x="82" y="87" font-weight="bold">output/</text>
+      <line x1="90" y1="98" x2="90" y2="165" stroke="#334155" stroke-width="1.5"/>
+      <line x1="90" y1="125" x2="120" y2="125" stroke="#334155" stroke-width="1.5"/>
+      <rect x="120" y="110" width="280" height="30" rx="6" fill="#dcfce7" stroke="#334155"/>
+      <text x="132" y="130">matching_results.tsv</text>
+      <line x1="90" y1="165" x2="120" y2="165" stroke="#334155" stroke-width="1.5"/>
+      <rect x="120" y="150" width="280" height="30" rx="6" fill="#dcfce7" stroke="#334155"/>
+      <text x="132" y="170">candidate_pairs.tsv</text>
+      <!-- code/ -->
+      <line x1="40" y1="212" x2="70" y2="212" stroke="#334155" stroke-width="1.5"/>
+      <rect x="70" y="196" width="200" height="32" rx="6" fill="#dbeafe" stroke="#334155"/>
+      <text x="82" y="217" font-weight="bold">code/</text>
+      <line x1="90" y1="228" x2="90" y2="255" stroke="#334155" stroke-width="1.5"/>
+      <line x1="90" y1="255" x2="120" y2="255" stroke="#334155" stroke-width="1.5"/>
+      <rect x="120" y="240" width="280" height="30" rx="6" fill="#dbeafe" stroke="#334155"/>
+      <text x="132" y="260" font-weight="bold">business_entity_resolution/</text>
+      <line x1="140" y1="270" x2="140" y2="373" stroke="#334155" stroke-width="1.5"/>
+      <line x1="140" y1="297" x2="170" y2="297" stroke="#334155" stroke-width="1.5"/>
+      <rect x="170" y="282" width="230" height="30" rx="6" fill="#dcfce7" stroke="#334155"/>
+      <text x="182" y="302">src/er_pipeline.py</text>
+      <line x1="140" y1="335" x2="170" y2="335" stroke="#334155" stroke-width="1.5"/>
+      <rect x="170" y="320" width="230" height="30" rx="6" fill="#f1f5f9" stroke="#334155"/>
+      <text x="182" y="340">README.md</text>
+      <line x1="140" y1="373" x2="170" y2="373" stroke="#334155" stroke-width="1.5"/>
+      <rect x="170" y="358" width="230" height="30" rx="6" fill="#f1f5f9" stroke="#334155"/>
+      <text x="182" y="378">requirements.txt</text>
+      <!-- Documentation -->
+      <line x1="40" y1="426" x2="70" y2="426" stroke="#334155" stroke-width="1.5"/>
+      <rect x="70" y="410" width="330" height="32" rx="6" fill="#f1f5f9" stroke="#334155"/>
+      <text x="82" y="431">Documentation_template.md</text>
+      <!-- annotations -->
+      <line x1="400" y1="145" x2="452" y2="145" stroke="#334155" stroke-width="1.5" marker-end="url(#ch11-arrow)"/>
+      <rect x="455" y="110" width="325" height="70" rx="6" fill="#fef3c7" stroke="#334155"/>
+      <text x="467" y="132" font-weight="bold">writer loop in main()</text>
+      <text x="467" y="150">same run, same te1 order</text>
+      <text x="467" y="168">matching file = leaderboard upload</text>
+      <line x1="400" y1="297" x2="452" y2="297" stroke="#334155" stroke-width="1.5" marker-end="url(#ch11-arrow)"/>
+      <rect x="455" y="282" width="325" height="30" rx="6" fill="#fef3c7" stroke="#334155"/>
+      <text x="467" y="302">copied from /kaggle/working/er_pipeline.py</text>
+      <line x1="400" y1="355" x2="452" y2="355" stroke="#334155" stroke-width="1.5" marker-end="url(#ch11-arrow)"/>
+      <rect x="455" y="322" width="325" height="66" rx="6" fill="#fef3c7" stroke="#334155"/>
+      <text x="467" y="344" font-weight="bold">fetched from RAW_BASE</text>
+      <text x="467" y="362">or added by hand when the branch</text>
+      <text x="467" y="380">is not pushed (cell 6 prints a warning)</text>
+      <line x1="400" y1="426" x2="452" y2="426" stroke="#334155" stroke-width="1.5" marker-end="url(#ch11-arrow)"/>
+      <rect x="455" y="411" width="325" height="30" rx="6" fill="#fef3c7" stroke="#334155"/>
+      <text x="467" y="431">team fields and Section 8 filled before zipping</text>
+    </svg>
+    <figcaption>Figure 11.1 — Submission package tree as assembled by cell 6 of <code>kaggle_run.ipynb</code> (<code>shutil.make_archive(PKG, "zip", root_dir=PKG)</code>), with the origin of each file.</figcaption>
+  </figure>
+
+  <h2>11.4 The Kaggle notebook</h2>
+  <p><code>notebooks/kaggle_run.ipynb</code> is the reference way to produce the package on a machine that has the dataset, the dependencies and enough memory, without cloning the repository. It targets a Kaggle kernel with internet enabled and uses <code>/kaggle/working</code> as its only scratch area. Table 11.2 walks through the cells.</p>
+  <table class="tbl">
+    <caption>Table 11.2 — Cells of <code>kaggle_run.ipynb</code> and their purpose.</caption>
+    <thead><tr><th>Cell</th><th>Kind</th><th>What it does</th><th>Failure mode and fallback</th></tr></thead>
+    <tbody>
+      <tr><td>0</td><td>markdown</td><td>Describes the six steps and states that no external data lookup is performed.</td><td>—</td></tr>
+      <tr><td>1</td><td>code</td><td><code>pip install -q gdown rapidfuzz lightgbm</code>.</td><td>Needs internet; on a kernel without it, rapidfuzz and lightgbm are usually pre-installed.</td></tr>
+      <tr><td>2</td><td>code</td><td>Locates the data: <code>find_train_source1("/kaggle/input")</code> globs recursively for <code>train_source1.tsv</code> (shortest path wins); otherwise <code>gdown.download(id=GDRIVE_ID)</code> fetches <code>/kaggle/working/data.zip</code> (skipped when the zip is already present), <code>unzip -q -o</code> extracts it under <code>/kaggle/working/data</code>, and the glob is repeated. <code>DATA_DIR</code> is the grandparent of the hit, <code>TEST_DIR = DATA_DIR/test</code>.</td><td>Asserts when no <code>train_source1.tsv</code> is found; attaching the dataset as a Kaggle input avoids any download.</td></tr>
+      <tr><td>3</td><td>code</td><td>Fetches <code>er_pipeline.py</code>, <code>validate_submission.py</code> and <code>score.py</code> from <code>RAW_BASE</code> (raw.githubusercontent.com, branch <code>claude/wizardly-cori-snj0nx</code>) with <code>urllib.request.urlretrieve()</code>.</td><td>A failed fetch prints manual-upload instructions; only <code>er_pipeline.py</code> is asserted.</td></tr>
+      <tr><td>4</td><td>code</td><td>Runs <code>python er_pipeline.py --data-dir {DATA_DIR} --out-dir /kaggle/working/output</code>, then lists the output directory.</td><td>The run log (see Chapter 10) records the blocking ceiling, fold iterations and the selected <code>(thr, ratio)</code>.</td></tr>
+      <tr><td>5</td><td>code</td><td>Runs <code>validate_submission.py</code> on both files against <code>TEST_DIR</code>; a commented line shows how <code>score.py</code> scores a prediction file in ground-truth format.</td><td>Non-zero exit lists the issues; the package must not be built until it prints <code>PASS</code>.</td></tr>
+      <tr><td>6</td><td>code</td><td>Builds <code>{TEAM}_submission/</code>: copies the two TSVs and <code>er_pipeline.py</code>, fetches <code>README.md</code>, <code>requirements.txt</code> and <code>Documentation_template.md</code> from <code>RAW_BASE</code>, zips with <code>shutil.make_archive()</code>, lists the archive.</td><td>A failed fetch prints a warning and leaves that file out; <code>TEAM = "team"</code> must be edited first.</td></tr>
+      <tr><td>7</td><td>markdown</td><td>Where the files live under <code>/kaggle/working</code>, how to download them from the Output tab, and what to upload to the portal.</td><td>—</td></tr>
+    </tbody>
+  </table>
+
+  <h3>11.4.1 Dataset acquisition and mirrors</h3>
+  <p>Cell 2 prefers an attached Kaggle input because it needs no transfer and is version-pinned by Kaggle. The Google Drive path uses file id <code>1bukugde70Drs9bHw8nr5oSr72ZPHDHzc</code>, one of the two links in the repository README. A second mirror is the challenge portal's own download, <code>https://cdn.unstop.com/files/6ab10eb3b23ba_student_resource.zip</code>, a plain HTTPS URL that needs no <code>gdown</code>; replacing <code>gdown.download()</code> with <code>urllib.request.urlretrieve(URL, ZIP_PATH)</code> is the only change. Both archives are searched with the same recursive glob, so the nesting inside the zip (for example a <code>student_resource/</code> folder wrapping <code>dataset/</code> and <code>utils/</code>, as the problem statement implies) is irrelevant; <code>find_data_dir()</code> applies the same recursive glob and grandparent rule when <code>--data-dir</code> is omitted, searching <code>/kaggle/input</code>, the working directory, its parent and <code>dataset/</code> in that order and taking the first hit rather than the shortest path.</p>
+
+  <h3>11.4.2 Code acquisition</h3>
+  <p>Cell 3 assumes that the branch named in <code>RAW_BASE</code> has been pushed; a raw URL for a local-only branch returns HTTP 404. When the repository is not pushed, or the kernel has no internet, the fallback is to upload the three files into <code>/kaggle/working</code> by hand (Kaggle sidebar, Add data, Upload) and re-run the cell; the same applies to the files fetched in cell 6, whose warning names the missing file to add to the package folder before zipping. Attaching a repository snapshot as a Kaggle dataset and replacing <code>fetch()</code> with a <code>shutil.copy()</code> from <code>/kaggle/input</code> for each entry of <code>FILES</code> removes the dependency on the branch name.</p>
+  <aside class="warn"><strong>Risk.</strong> The zip must be built from the output directory the validator checked, in the same session. Re-running cell 4 regenerates both TSVs, and because LightGBM is not seeded (Section 11.5) the new <code>matching_results.tsv</code> can differ in a few borderline pairs from the one uploaded to the leaderboard. Run cells 4, 5 and 6 once, in order, and upload the leaderboard file from the same <code>/kaggle/working/output</code>.</aside>
+
+  <h2>11.5 Determinism</h2>
+  <p>Most of the pipeline is a pure function of the data and library versions: <code>TfidfVectorizer</code> vocabularies, the sparse products in <code>topk_sparse()</code>, <code>np.argpartition</code>, rapidfuzz scores, <code>GroupKFold</code> (which never shuffles) and the <code>(thr, ratio)</code> grid. The stochastic component is LightGBM. The <code>params</code> dictionary in <code>main()</code> sets <code>feature_fraction=0.8</code>, <code>bagging_fraction=0.8</code> and <code>bagging_freq=1</code>, so every tree is grown on a random 80 % of rows and columns, but sets no <code>seed</code>. LightGBM then uses its built-in default seeds, which keeps a single-threaded run repeatable, while <code>n_jobs=-1</code> lets histogram construction be split across threads in an order that varies between machines and builds. The OOF probabilities, the fold best iterations, the refit round count <code>int(np.mean(iters) * 1.1)</code> and a few borderline decisions can therefore differ between environments.</p>
+  <p>The recommended follow-up is to add <code>seed=42</code>, <code>deterministic=True</code> and <code>force_row_wise=True</code> to <code>params</code>, so that LightGBM neither draws unseeded samples nor picks its histogram strategy by timing; this costs some speed and changes nothing in the OOF sweep or the decision layer. A minor second source is tie-breaking: <code>decode_table()</code> sorts by probability with the default quicksort, which is not stable, so bit-identical probabilities could be ordered differently across NumPy versions; <code>kind="stable"</code> removes this. <code>Documentation_template.md</code> already calls for a seed for bit-exact reproduction.</p>
+
+  <h2>11.6 Dependency pinning</h2>
+  <p><code>requirements.txt</code> currently states lower bounds (<code>numpy&gt;=1.24</code>, <code>pandas&gt;=2.0</code>, <code>scipy&gt;=1.10</code>, <code>scikit-learn&gt;=1.3</code>, <code>lightgbm&gt;=4.0</code>, <code>rapidfuzz&gt;=3.0</code>). Lower bounds document the API assumptions, such as the callback form <code>lgb.early_stopping(100, verbose=False)</code> that LightGBM 4 makes the only early-stopping interface, but neither satisfy the package specification's request for pinned versions nor fix the floating-point behaviour on which Section 11.5 depends. Before the final zip, the versions of the environment that produced the submitted files should be captured with <code>pip freeze</code> restricted to these six packages, written as exact <code>==</code> pins with the Python version in a comment, and re-installed in a clean environment to confirm that the validator passes and the output files are identical.</p>
+
+  <h2>11.7 Reproducibility checklist</h2>
+  <p>Table 11.3 collects the conditions under which a reviewer can regenerate both output files from the package alone and obtain the same leaderboard score. Each row names the artefact that evidences it.</p>
+  <table class="tbl">
+    <caption>Table 11.3 — Reproducibility checklist for the final package.</caption>
+    <thead><tr><th>#</th><th>Check</th><th>Evidence / where it lives</th><th>Status</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>Only the provided train/test TSVs are read; no network call other than <code>pip</code>.</td><td><code>load_split()</code>, <code>find_data_dir()</code>; import fallback in <code>er_pipeline.py</code></td><td>satisfied by design</td></tr>
+      <tr><td>2</td><td>Single entry point regenerates both files: <code>python src/er_pipeline.py --data-dir … --out-dir …</code>.</td><td>pipeline <code>README.md</code>, cell 4</td><td>satisfied</td></tr>
+      <tr><td>3</td><td>Both files come from one invocation and pass <code>validate_submission.py</code> (<code>PASS</code>, exit 0).</td><td>cell 5 output, kept with the run log</td><td>to be confirmed on the real data</td></tr>
+      <tr><td>4</td><td>Uploaded <code>matching_results.tsv</code> is byte-identical to <code>output/matching_results.tsv</code> in the zip.</td><td>checksum recorded in <code>Documentation_template.md</code> Section 8</td><td>to be recorded</td></tr>
+      <tr><td>5</td><td>Exact dependency pins and Python version.</td><td><code>requirements.txt</code> (<code>==</code> pins from <code>pip freeze</code>)</td><td>follow-up (currently lower bounds)</td></tr>
+      <tr><td>6</td><td>LightGBM seeded and deterministic (<code>seed=42</code>, <code>deterministic=True</code>, <code>force_row_wise=True</code>); stable sort in <code>decode_table()</code>.</td><td><code>params</code> in <code>main()</code></td><td>follow-up</td></tr>
+      <tr><td>7</td><td>Run log archived: blocking ceiling, fold iterations, OOF macro F<sub>0.5</sub>, selected <code>(thr, ratio)</code>, per-country match rate.</td><td>cell 4 output; Section 8 of the methodology document</td><td>to be filled from the run log</td></tr>
+      <tr><td>8</td><td>Package layout matches Figure 11.1; <code>TEAM</code> set; team fields of the methodology document filled.</td><td><code>unzip -l</code> listing in cell 6</td><td>to be confirmed at packaging time</td></tr>
+      <tr><td>9</td><td>Licences and model size within limits (MIT/Apache-2.0-compatible libraries, tree ensemble far below 8B parameters).</td><td>see Chapter 13</td><td>satisfied</td></tr>
+      <tr><td>10</td><td>Smoke test passes on the synthetic set (<code>make_synthetic_dataset.py</code>, pipeline, validator, scorer).</td><td>repository README, <em>Smoke test</em> section</td><td>satisfied per README</td></tr>
+    </tbody>
+  </table>
+  <p>Items 5 and 6 are the only ones that require a code change: three keys added to <code>params</code>, one <code>kind="stable"</code> argument in <code>decode_table()</code>, and rewritten pins in <code>requirements.txt</code>. Until they are applied, a re-run reproduces the candidates, features and grid exactly but not necessarily every borderline match, so the leaderboard file is the artefact of one specific run and is archived with its log.</p>
+
+  <h2>11.8 Run-time expectations</h2>
+  <p>The stages scale differently. Blocking is bounded by the chunked sparse products of <code>topk_sparse()</code>, about 2·10<sup>7</sup> dense cells per chunk (see Chapter 12). Pair features in <code>features()</code> are Python-level list comprehensions over the candidate table, at least one rapidfuzz call per string feature per pair (<code>n_alias_best</code> makes one per alias combination), and are expected to dominate wall-clock time; their cost is linear in the pair count the log reports as <em>pairs per S1</em>. LightGBM runs five folds with early stopping plus one refit on all cores. For the synthetic smoke test of 3,000 training and 1,500 test S1 entities generated by <code>make_synthetic_dataset.py</code>, the repository README reports about 30 s end to end; this figure is quoted from the README, not measured for this document, and says nothing about the real data. Table 11.4 reserves the slots for the real data; the elapsed-seconds prefix that <code>log()</code> prints at each stage boundary supplies them.</p>
+  <table class="tbl">
+    <caption>Table 11.4 — Run-time and size figures to be taken from the run log (not yet measured).</caption>
+    <thead><tr><th>Quantity</th><th>Log line</th><th>Value</th></tr></thead>
+    <tbody>
+      <tr><td>Train candidate pairs, pairs per S1</td><td><code>blocking: N pairs (x per S1)</code> (train)</td><td>to be filled from the run log</td></tr>
+      <tr><td>Test candidate pairs, pairs per S1</td><td><code>blocking: N pairs (x per S1)</code> (test)</td><td>to be filled from the run log</td></tr>
+      <tr><td>Fold best iterations, refit rounds</td><td><code>fold k: best_iter=…</code></td><td>to be filled from the run log</td></tr>
+      <tr><td>Wall-clock: load + prep, blocking, features, training, decode + write</td><td>elapsed-seconds prefix of each <code>log()</code> line</td><td>to be filled from the run log</td></tr>
+      <tr><td>Peak memory (Kaggle kernel)</td><td>kernel resource panel</td><td>to be filled from the run log</td></tr>
+      <tr><td>Test S1 entities matched, by country</td><td><code>test: n/N S1 entities matched; by country: …</code></td><td>to be filled from the run log</td></tr>
+      <tr><td>Size of the two TSVs and of the zip</td><td><code>ls -la {OUT_DIR}</code>, <code>unzip -l</code> in cells 4 and 6</td><td>to be filled from the run log</td></tr>
+    </tbody>
+  </table>
+</section>

@@ -1,0 +1,276 @@
+<section class="chapter" id="ch-04">
+  <h1><span class="num">4</span> System Architecture Overview</h1>
+  <p class="lead">This chapter describes the solution as a software system: its architectural style, the modules of <code>er_pipeline.py</code> and the responsibility of each function, the data contracts between stages, the control flow of <code>main()</code> for the training and test splits, the runtime environment with its dependencies and licences, the logging design, and the configuration surface. Chapters 5 to 11 go deeper into each stage; this chapter fixes the vocabulary and interfaces they rely on.</p>
+
+  <h2>4.1 Architectural style</h2>
+  <p>The system is a <em>single-process batch pipeline</em>: one Python module, <code>er_pipeline.py</code>, with one entry point, <code>main()</code>, that starts from the raw TSV files and ends with the two submission files. There are no services, no state between runs and no intermediate files. The organising principle is a chain of <em>pure functions</em> over two in-memory containers: pandas DataFrames for record-level and pair-level tables, and SciPy compressed-sparse-row (CSR) matrices for the TF-IDF (term frequency–inverse document frequency) representations used in blocking. Each stage takes frames in and returns a new frame out: <code>prep()</code> copies its input before adding columns, <code>block()</code> and <code>features()</code> build fresh frames, and <code>decode_table()</code> copies only the three columns it needs. No function mutates module-level state; the only globals are the lookup tables (<code>NAME_ABBR</code>, <code>LEGAL</code>, <code>ADDR_ABBR</code>, <code>ADDR_STOP</code>), the compiled regular expressions and the start timestamp <code>T0</code> that <code>log()</code> reads.</p>
+  <p>Three considerations tie this style to the evaluation. First, the metric is a macro-average of per-entity F<sub>0.5</sub> with an all-or-nothing rule for singletons (see Chapter 2), so the decision parameters must be tuned on out-of-fold predictions computed from exactly the features the test path will see; a single linear flow guarantees this because both splits pass through the identical <code>prep()</code> → <code>block()</code> → <code>features()</code> sequence and the column list <code>feats</code> is derived once and reused. Second, the corpus is expected to fit in the memory of a Kaggle CPU kernel, so a scheduler or checkpointing layer would add failure modes without capability; the one memory-sensitive operation, the dense chunk inside <code>topk_sparse()</code>, is bounded by construction (see Chapter 12). Third, the fair-play rules require a reviewer to verify that no external lookup occurs, and a single file whose only network action is an optional <code>pip install rapidfuzz</code> fallback is the easiest artefact to audit (see Chapter 13).</p>
+  <p>A convention that runs through every stage is <em>positional row identity</em>. After <code>prep()</code> resets the index, every record is addressed by its integer position; candidate, feature and decode rows carry the pair <code>(i1, i2)</code>, where <code>i1</code> indexes the S1 frame and <code>i2</code> the concatenated S2+S3 frame, and entity identifiers are re-attached only at the edges: by <code>to_lists()</code> on output and by the labelling and recall-diagnostic lines of <code>main()</code>, which index <code>tr1.entity_id.values</code> and <code>tr2.entity_id.values</code> by position. This keeps the look-ups in <code>features()</code> and the group-by operations unambiguous and lets <code>GroupKFold</code> group by <code>i1</code> so that all candidates of one S1 entity fall into the same fold (see Chapter 10).</p>
+
+  <h2>4.2 Module map</h2>
+  <p>Figure 4.1 arranges the functions in the five lanes that correspond to the section headers of the source, with <code>main()</code> as orchestrator underneath. Data flow left to right through the lanes; control flows from <code>main()</code> upward into each lane.</p>
+  <figure>
+    <svg viewBox="0 0 800 420" width="100%" font-family="inherit" font-size="13">
+      <defs>
+        <marker id="ch04-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="#334155"/>
+        </marker>
+      </defs>
+      <!-- lane headers -->
+      <rect x="8" y="10" width="150" height="28" rx="6" fill="#cbd5e1" stroke="#334155"/>
+      <text x="83" y="29" text-anchor="middle" fill="#0f172a" font-weight="bold">Loading</text>
+      <rect x="166" y="10" width="150" height="28" rx="6" fill="#cbd5e1" stroke="#334155"/>
+      <text x="241" y="29" text-anchor="middle" fill="#0f172a" font-weight="bold">Normalisation</text>
+      <rect x="324" y="10" width="150" height="28" rx="6" fill="#cbd5e1" stroke="#334155"/>
+      <text x="399" y="29" text-anchor="middle" fill="#0f172a" font-weight="bold">Blocking</text>
+      <rect x="482" y="10" width="150" height="28" rx="6" fill="#cbd5e1" stroke="#334155"/>
+      <text x="557" y="29" text-anchor="middle" fill="#0f172a" font-weight="bold">Features</text>
+      <rect x="640" y="10" width="150" height="28" rx="6" fill="#cbd5e1" stroke="#334155"/>
+      <text x="715" y="29" text-anchor="middle" fill="#0f172a" font-weight="bold">Scoring / decoding</text>
+      <!-- data-flow arrows between lanes -->
+      <line x1="158" y1="24" x2="166" y2="24" stroke="#334155" stroke-width="1.5" marker-end="url(#ch04-arrow)"/>
+      <line x1="316" y1="24" x2="324" y2="24" stroke="#334155" stroke-width="1.5" marker-end="url(#ch04-arrow)"/>
+      <line x1="474" y1="24" x2="482" y2="24" stroke="#334155" stroke-width="1.5" marker-end="url(#ch04-arrow)"/>
+      <line x1="632" y1="24" x2="640" y2="24" stroke="#334155" stroke-width="1.5" marker-end="url(#ch04-arrow)"/>
+      <!-- lane 1: loading -->
+      <rect x="8" y="48" width="150" height="26" rx="6" fill="#f1f5f9" stroke="#334155"/>
+      <text x="83" y="66" text-anchor="middle" fill="#0f172a">find_data_dir()</text>
+      <rect x="8" y="82" width="150" height="26" rx="6" fill="#f1f5f9" stroke="#334155"/>
+      <text x="83" y="100" text-anchor="middle" fill="#0f172a">read_tsv()</text>
+      <rect x="8" y="116" width="150" height="26" rx="6" fill="#dbeafe" stroke="#334155"/>
+      <text x="83" y="134" text-anchor="middle" fill="#0f172a">load_split()</text>
+      <rect x="8" y="150" width="150" height="26" rx="6" fill="#f1f5f9" stroke="#334155"/>
+      <text x="83" y="168" text-anchor="middle" fill="#0f172a">profile()</text>
+      <!-- lane 2: normalisation -->
+      <rect x="166" y="48" width="150" height="26" rx="6" fill="#fef3c7" stroke="#334155"/>
+      <text x="241" y="66" text-anchor="middle" fill="#0f172a">tables + regexes</text>
+      <rect x="166" y="82" width="150" height="26" rx="6" fill="#f1f5f9" stroke="#334155"/>
+      <text x="241" y="100" text-anchor="middle" fill="#0f172a">basic() / expand()</text>
+      <rect x="166" y="116" width="150" height="26" rx="6" fill="#f1f5f9" stroke="#334155"/>
+      <text x="241" y="134" text-anchor="middle" fill="#0f172a">norm_name() / core_name()</text>
+      <rect x="166" y="150" width="150" height="26" rx="6" fill="#f1f5f9" stroke="#334155"/>
+      <text x="241" y="168" text-anchor="middle" fill="#0f172a">name_parts()</text>
+      <rect x="166" y="184" width="150" height="26" rx="6" fill="#f1f5f9" stroke="#334155"/>
+      <text x="241" y="202" text-anchor="middle" fill="#0f172a">norm_addr() / _addr_nums()</text>
+      <rect x="166" y="218" width="150" height="26" rx="6" fill="#dbeafe" stroke="#334155"/>
+      <text x="241" y="236" text-anchor="middle" fill="#0f172a">prep()</text>
+      <!-- lane 3: blocking -->
+      <rect x="324" y="48" width="150" height="26" rx="6" fill="#f1f5f9" stroke="#334155"/>
+      <text x="399" y="66" text-anchor="middle" fill="#0f172a">TfidfVectorizer x3</text>
+      <rect x="324" y="82" width="150" height="26" rx="6" fill="#f1f5f9" stroke="#334155"/>
+      <text x="399" y="100" text-anchor="middle" fill="#0f172a">topk_sparse()</text>
+      <rect x="324" y="116" width="150" height="26" rx="6" fill="#f1f5f9" stroke="#334155"/>
+      <text x="399" y="134" text-anchor="middle" fill="#0f172a">pair_cos()</text>
+      <rect x="324" y="150" width="150" height="26" rx="6" fill="#dbeafe" stroke="#334155"/>
+      <text x="399" y="168" text-anchor="middle" fill="#0f172a">block()</text>
+      <!-- lane 4: features -->
+      <rect x="482" y="48" width="150" height="26" rx="6" fill="#f1f5f9" stroke="#334155"/>
+      <text x="557" y="66" text-anchor="middle" fill="#0f172a">jacc()</text>
+      <rect x="482" y="82" width="150" height="26" rx="6" fill="#f1f5f9" stroke="#334155"/>
+      <text x="557" y="100" text-anchor="middle" fill="#0f172a">rapidfuzz fuzz / JaroWinkler</text>
+      <rect x="482" y="116" width="150" height="26" rx="6" fill="#dbeafe" stroke="#334155"/>
+      <text x="557" y="134" text-anchor="middle" fill="#0f172a">features()</text>
+      <!-- lane 5: scoring -->
+      <rect x="640" y="48" width="150" height="26" rx="6" fill="#f1f5f9" stroke="#334155"/>
+      <text x="715" y="66" text-anchor="middle" fill="#0f172a">f05() / macro_f05()</text>
+      <rect x="640" y="82" width="150" height="26" rx="6" fill="#dbeafe" stroke="#334155"/>
+      <text x="715" y="100" text-anchor="middle" fill="#0f172a">decode_table()</text>
+      <rect x="640" y="116" width="150" height="26" rx="6" fill="#dbeafe" stroke="#334155"/>
+      <text x="715" y="134" text-anchor="middle" fill="#0f172a">decide()</text>
+      <rect x="640" y="150" width="150" height="26" rx="6" fill="#dbeafe" stroke="#334155"/>
+      <text x="715" y="168" text-anchor="middle" fill="#0f172a">to_lists()</text>
+      <!-- main bar -->
+      <rect x="8" y="300" width="782" height="60" rx="6" fill="#dcfce7" stroke="#334155"/>
+      <text x="399" y="322" text-anchor="middle" fill="#0f172a" font-weight="bold">main()</text>
+      <text x="399" y="344" text-anchor="middle" fill="#0f172a">argparse · labels y from gt · GroupKFold OOF lgb.train · (thr, ratio) sweep · refit · TSV writer · log()</text>
+      <!-- control arrows from main to lanes -->
+      <line x1="83" y1="300" x2="83" y2="186" stroke="#334155" stroke-width="1.5" marker-end="url(#ch04-arrow)"/>
+      <line x1="241" y1="300" x2="241" y2="254" stroke="#334155" stroke-width="1.5" marker-end="url(#ch04-arrow)"/>
+      <line x1="399" y1="300" x2="399" y2="186" stroke="#334155" stroke-width="1.5" marker-end="url(#ch04-arrow)"/>
+      <line x1="557" y1="300" x2="557" y2="152" stroke="#334155" stroke-width="1.5" marker-end="url(#ch04-arrow)"/>
+      <line x1="715" y1="300" x2="715" y2="186" stroke="#334155" stroke-width="1.5" marker-end="url(#ch04-arrow)"/>
+      <!-- legend -->
+      <rect x="8" y="380" width="18" height="14" rx="3" fill="#dbeafe" stroke="#334155"/>
+      <text x="32" y="392" fill="#0f172a">stage entry point called by main()</text>
+      <rect x="300" y="380" width="18" height="14" rx="3" fill="#f1f5f9" stroke="#334155"/>
+      <text x="324" y="392" fill="#0f172a">helper</text>
+      <rect x="420" y="380" width="18" height="14" rx="3" fill="#fef3c7" stroke="#334155"/>
+      <text x="444" y="392" fill="#0f172a">NAME_ABBR, LEGAL, ADDR_ABBR, ADDR_STOP, _ALIAS, _postal, ...</text>
+    </svg>
+    <figcaption>Figure 4.1 — Component map of <code>er_pipeline.py</code>: functions grouped by the five source sections, with <code>main()</code> orchestrating every lane. Blue boxes are the entry points that <code>main()</code> calls directly; grey boxes are helpers used inside a lane.</figcaption>
+  </figure>
+  <p><strong>Loading.</strong> <code>find_data_dir()</code> searches recursively for <code>train_source1.tsv</code> under <code>/kaggle/input</code>, the working directory, its parent and <code>dataset/</code>, and returns the grandparent of the first hit so that one directory holds <code>train/</code> and <code>test/</code>. <code>read_tsv()</code> reads with <code>dtype=str</code>, <code>keep_default_na=False</code> and <code>quoting=3</code>, so blank fields stay empty strings, a name such as "NA" is not turned into a missing value, and a stray quotation mark cannot swallow the following rows. <code>load_split()</code> reads the three source files, concatenates S2 and S3 and, when present, parses the ground truth into a dictionary from S1 identifier to set of matched identifiers. <code>profile()</code> logs corpus statistics.</p>
+  <p><strong>Normalisation.</strong> <code>basic()</code>, <code>expand()</code>, <code>norm_name()</code>, <code>core_name()</code>, <code>name_parts()</code>, <code>norm_addr()</code> and <code>_addr_nums()</code> are string-level helpers driven by the four lookup tables and the regular expressions <code>_punct</code>, <code>_space</code>, <code>_digits</code>, <code>_postal</code>, <code>_dotted</code> and <code>_ALIAS</code>; <code>prep()</code> applies them column-wise (see Chapter 5).</p>
+  <p><strong>Blocking.</strong> <code>topk_sparse()</code> returns, for each row of one L2-normalised sparse matrix, the indices and cosine scores of its top-k rows in another, in chunks sized from <code>max_cells</code>; <code>pair_cos()</code> computes the cosine of listed row pairs in slices; <code>block()</code> fits three <code>TfidfVectorizer</code> instances and unions four candidate views (see Chapter 6).</p>
+  <p><strong>Features.</strong> <code>jacc()</code> is the token Jaccard index; <code>features()</code> computes every pairwise and contextual feature over the candidate frame with rapidfuzz scorers (see Chapter 7).</p>
+  <p><strong>Scoring and decoding.</strong> <code>f05()</code> is the per-entity metric including the singleton rule, <code>macro_f05()</code> averages it, and <code>decode_table()</code>, <code>decide()</code> and <code>to_lists()</code> turn probabilities into identifier lists (see Chapter 9). Argument parsing, labelling, LightGBM training under <code>GroupKFold</code>, the <code>(thr, ratio)</code> sweep, the refit and the TSV writer live in <code>main()</code> (see Chapters 8, 10 and 11).</p>
+
+  <h2>4.3 Data contracts between stages</h2>
+  <p>Table 4.1 states what each stage consumes and adds. Contracts are enforced by column names rather than types; the two collection-valued columns (<code>name_alts</code>, a list of alias variants, and <code>nums</code>, a <code>frozenset</code> of digit runs) are consumed by <code>features()</code> and never reach the model.</p>
+  <table class="tbl">
+    <caption>Table 4.1 — Stage-by-stage data contract: what each function requires from its input and what it produces.</caption>
+    <thead><tr><th>Stage / function</th><th>Input</th><th>Output</th></tr></thead>
+    <tbody>
+      <tr><td>Load: <code>read_tsv()</code>, <code>load_split()</code></td><td>The three source TSVs of a split, plus <code>{split}_ground_truth.tsv</code> when it exists (train only)</td><td><code>s1</code> and <code>other</code> (S2 followed by S3, <code>ignore_index=True</code>) with columns <code>entity_id</code>, <code>business_name</code>, <code>business_address</code>, <code>country</code>, all <code>str</code>; <code>gt</code>: dict S1 id → set of ids, or <code>None</code></td></tr>
+      <tr><td>Normalise: <code>prep()</code></td><td>The four raw columns</td><td>Same rows, index reset to 0…n−1, plus <code>name_n</code>, <code>name_c</code>, <code>name_alts</code> (list), <code>addr_n</code>, <code>addr_c</code>, <code>postal</code>, <code>nums</code> (frozenset), <code>house</code>, <code>country_n</code>, <code>src</code> (first two characters of <code>entity_id</code>)</td></tr>
+      <tr><td>Block: <code>block()</code></td><td><code>name_c</code>, <code>addr_c</code>, <code>country_n</code>, <code>postal</code> of both frames</td><td>Candidate frame <code>cand</code>: <code>i1</code>, <code>i2</code> (positions, deduplicated), <code>cos_name</code>, <code>cos_full</code>, <code>cos_addr</code> (float32)</td></tr>
+      <tr><td>Features: <code>features()</code></td><td><code>cand</code> plus the prepared frames (looked up by <code>.loc[i1]</code>, <code>.loc[i2]</code>)</td><td>Feature frame <code>f</code>: the five candidate columns plus 35 feature columns, 38 model inputs in total; on train <code>main()</code> appends the label <code>y</code></td></tr>
+      <tr><td>Model: <code>lgb.train()</code> / <code>predict()</code></td><td><code>f[feats]</code>, where <code>feats</code> = every column except <code>i1</code>, <code>i2</code>, <code>y</code></td><td>Probability vector aligned with the rows of <code>f</code> (<code>oof</code> on train, <code>pte</code> on test)</td></tr>
+      <tr><td>Decode: <code>decode_table()</code></td><td><code>f[["i1","i2","is_s3"]]</code> and the probability vector</td><td>Decode table <code>d</code>: <code>i1</code>, <code>i2</code>, <code>is_s3</code>, <code>p</code>, <code>best</code>; exactly one row per <code>i2</code> that occurs in <code>f</code> (the highest-probability S1 for that record)</td></tr>
+      <tr><td>Decide: <code>decide()</code></td><td><code>d</code>, <code>thr</code>, <code>ratio</code></td><td>Row subset of <code>d</code> with <code>p ≥ thr</code> and <code>p ≥ ratio·best</code></td></tr>
+      <tr><td>Lists: <code>to_lists()</code></td><td>Any frame with <code>i1</code> and an id column, plus <code>s1</code>, <code>other</code></td><td>Dict S1 <code>entity_id</code> → list of S2/S3 ids, with a key for every S1 record (empty list = singleton)</td></tr>
+      <tr><td>Write: <code>main()</code></td><td>The <code>matches</code> and <code>cands</code> dicts</td><td><code>matching_results.tsv</code>, <code>candidate_pairs.tsv</code>: one row per test S1 id, comma-joined ids deduplicated by <code>dict.fromkeys()</code></td></tr>
+    </tbody>
+  </table>
+  <p>Three invariants follow. Because <code>other</code> concatenates S2 and S3, one <code>i2</code> index space covers both sources and the <code>src</code> column, from which <code>is_s3</code> is derived, tells them apart. Because <code>feats</code> is reused verbatim on the test frame, the column order emitted by <code>features()</code> is part of the contract. Because <code>to_lists()</code> initialises an entry for every S1 identifier before filling in pairs, an entity with no surviving pair is emitted as an empty row rather than omitted, which the singleton rule and the validator both require.</p>
+
+  <h2>4.4 Control flow of <code>main()</code></h2>
+  <p>Figure 4.2 shows the two paths <code>main()</code> executes in sequence. Both splits are loaded and profiled first, so a missing test file fails before any training time is spent.</p>
+  <figure>
+    <svg viewBox="0 0 800 440" width="100%" font-family="inherit" font-size="13">
+      <defs>
+        <marker id="ch04-arrow2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="#334155"/>
+        </marker>
+      </defs>
+      <rect x="40" y="10" width="320" height="26" rx="6" fill="#cbd5e1" stroke="#334155"/>
+      <text x="200" y="28" text-anchor="middle" fill="#0f172a" font-weight="bold">Train path (labels from gt)</text>
+      <rect x="440" y="10" width="320" height="26" rx="6" fill="#cbd5e1" stroke="#334155"/>
+      <text x="600" y="28" text-anchor="middle" fill="#0f172a" font-weight="bold">Test path (no labels)</text>
+      <!-- left column -->
+      <rect x="40" y="50" width="320" height="26" rx="6" fill="#f1f5f9" stroke="#334155"/>
+      <text x="200" y="68" text-anchor="middle" fill="#0f172a">load_split("train") → profile()</text>
+      <rect x="40" y="88" width="320" height="26" rx="6" fill="#f1f5f9" stroke="#334155"/>
+      <text x="200" y="106" text-anchor="middle" fill="#0f172a">prep(tr1), prep(tr2)</text>
+      <rect x="40" y="126" width="320" height="26" rx="6" fill="#dbeafe" stroke="#334155"/>
+      <text x="200" y="144" text-anchor="middle" fill="#0f172a">block(tr1, tr2) → ctr</text>
+      <rect x="40" y="164" width="320" height="26" rx="6" fill="#dbeafe" stroke="#334155"/>
+      <text x="200" y="182" text-anchor="middle" fill="#0f172a">features(ctr) → ftr; ftr.y from gt; recall logs</text>
+      <rect x="40" y="202" width="320" height="26" rx="6" fill="#dcfce7" stroke="#334155"/>
+      <text x="200" y="220" text-anchor="middle" fill="#0f172a">GroupKFold(folds) × lgb.train, early stop → oof</text>
+      <rect x="40" y="240" width="320" height="26" rx="6" fill="#dcfce7" stroke="#334155"/>
+      <text x="200" y="258" text-anchor="middle" fill="#0f172a">decode_table(ftr, oof) → dtr</text>
+      <rect x="40" y="278" width="320" height="26" rx="6" fill="#fef3c7" stroke="#334155"/>
+      <text x="200" y="296" text-anchor="middle" fill="#0f172a">sweep ratio × thr on macro_f05 → best_thr, best_ratio</text>
+      <rect x="40" y="316" width="320" height="26" rx="6" fill="#dcfce7" stroke="#334155"/>
+      <text x="200" y="334" text-anchor="middle" fill="#0f172a">lgb.train(all pairs, 1.1 × mean best_iter) → model</text>
+      <rect x="40" y="354" width="320" height="26" rx="6" fill="#f1f5f9" stroke="#334155"/>
+      <text x="200" y="372" text-anchor="middle" fill="#0f172a">print top-15 gain importances</text>
+      <!-- right column -->
+      <rect x="440" y="50" width="320" height="26" rx="6" fill="#f1f5f9" stroke="#334155"/>
+      <text x="600" y="68" text-anchor="middle" fill="#0f172a">load_split("test") → profile()</text>
+      <rect x="440" y="88" width="320" height="26" rx="6" fill="#f1f5f9" stroke="#334155"/>
+      <text x="600" y="106" text-anchor="middle" fill="#0f172a">prep(te1), prep(te2)</text>
+      <rect x="440" y="126" width="320" height="26" rx="6" fill="#dbeafe" stroke="#334155"/>
+      <text x="600" y="144" text-anchor="middle" fill="#0f172a">block(te1, te2) → cte  (vectorisers refit)</text>
+      <rect x="440" y="164" width="320" height="26" rx="6" fill="#dbeafe" stroke="#334155"/>
+      <text x="600" y="182" text-anchor="middle" fill="#0f172a">features(cte) → fte</text>
+      <rect x="440" y="202" width="320" height="26" rx="6" fill="#dcfce7" stroke="#334155"/>
+      <text x="600" y="220" text-anchor="middle" fill="#0f172a">model.predict(fte[feats]) → pte</text>
+      <rect x="440" y="240" width="320" height="26" rx="6" fill="#fef3c7" stroke="#334155"/>
+      <text x="600" y="258" text-anchor="middle" fill="#0f172a">decide(decode_table(fte, pte), best_thr, best_ratio)</text>
+      <rect x="440" y="278" width="320" height="26" rx="6" fill="#f1f5f9" stroke="#334155"/>
+      <text x="600" y="296" text-anchor="middle" fill="#0f172a">to_lists → matches; to_lists(fte[[i1,i2]]) → cands</text>
+      <rect x="440" y="316" width="320" height="26" rx="6" fill="#fee2e2" stroke="#334155"/>
+      <text x="600" y="334" text-anchor="middle" fill="#0f172a">write matching_results.tsv, candidate_pairs.tsv</text>
+      <rect x="440" y="354" width="320" height="26" rx="6" fill="#f1f5f9" stroke="#334155"/>
+      <text x="600" y="372" text-anchor="middle" fill="#0f172a">log match rate per country (France check)</text>
+      <!-- vertical arrows left -->
+      <line x1="200" y1="76" x2="200" y2="88" stroke="#334155" stroke-width="1.5" marker-end="url(#ch04-arrow2)"/>
+      <line x1="200" y1="114" x2="200" y2="126" stroke="#334155" stroke-width="1.5" marker-end="url(#ch04-arrow2)"/>
+      <line x1="200" y1="152" x2="200" y2="164" stroke="#334155" stroke-width="1.5" marker-end="url(#ch04-arrow2)"/>
+      <line x1="200" y1="190" x2="200" y2="202" stroke="#334155" stroke-width="1.5" marker-end="url(#ch04-arrow2)"/>
+      <line x1="200" y1="228" x2="200" y2="240" stroke="#334155" stroke-width="1.5" marker-end="url(#ch04-arrow2)"/>
+      <line x1="200" y1="266" x2="200" y2="278" stroke="#334155" stroke-width="1.5" marker-end="url(#ch04-arrow2)"/>
+      <line x1="200" y1="304" x2="200" y2="316" stroke="#334155" stroke-width="1.5" marker-end="url(#ch04-arrow2)"/>
+      <line x1="200" y1="342" x2="200" y2="354" stroke="#334155" stroke-width="1.5" marker-end="url(#ch04-arrow2)"/>
+      <!-- vertical arrows right -->
+      <line x1="600" y1="76" x2="600" y2="88" stroke="#334155" stroke-width="1.5" marker-end="url(#ch04-arrow2)"/>
+      <line x1="600" y1="114" x2="600" y2="126" stroke="#334155" stroke-width="1.5" marker-end="url(#ch04-arrow2)"/>
+      <line x1="600" y1="152" x2="600" y2="164" stroke="#334155" stroke-width="1.5" marker-end="url(#ch04-arrow2)"/>
+      <line x1="600" y1="190" x2="600" y2="202" stroke="#334155" stroke-width="1.5" marker-end="url(#ch04-arrow2)"/>
+      <line x1="600" y1="228" x2="600" y2="240" stroke="#334155" stroke-width="1.5" marker-end="url(#ch04-arrow2)"/>
+      <line x1="600" y1="266" x2="600" y2="278" stroke="#334155" stroke-width="1.5" marker-end="url(#ch04-arrow2)"/>
+      <line x1="600" y1="304" x2="600" y2="316" stroke="#334155" stroke-width="1.5" marker-end="url(#ch04-arrow2)"/>
+      <line x1="600" y1="342" x2="600" y2="354" stroke="#334155" stroke-width="1.5" marker-end="url(#ch04-arrow2)"/>
+      <!-- cross arrows: model and (thr, ratio) -->
+      <path d="M360,329 C400,329 400,215 440,215" fill="none" stroke="#334155" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#ch04-arrow2)"/>
+      <text x="400" y="268" text-anchor="middle" fill="#0f172a">model, feats</text>
+      <path d="M360,291 C400,291 400,253 440,253" fill="none" stroke="#334155" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#ch04-arrow2)"/>
+      <text x="400" y="290" text-anchor="middle" fill="#0f172a">(thr, ratio)</text>
+      <!-- footer -->
+      <text x="400" y="412" text-anchor="middle" fill="#0f172a">Both splits are loaded and profiled before the train path starts; the test path runs after the refit.</text>
+    </svg>
+    <figcaption>Figure 4.2 — Control flow of <code>main()</code>. The left column is executed on the training split, the right column on the test split; dashed arrows carry the three artefacts that cross between them (the fitted model, the feature list and the tuned decision parameters).</figcaption>
+  </figure>
+  <p>On the training path the label <code>y</code> of a candidate pair is 1 when the S2/S3 identifier belongs to the ground-truth set of the S1 identifier and 0 otherwise; pairs that blocking never produces are neither positives nor negatives and appear only in the recall diagnostics. <code>GroupKFold(args.folds)</code> with <code>groups=ftr.i1</code> yields out-of-fold (OOF) probabilities: a probability for every training pair from a model that never saw that pair's S1 entity. The decision parameters are chosen by exhaustive search on the OOF probabilities, and the final model is refit on all pairs with 1.1 times the mean early-stopped iteration count.</p>
+  <p>On the test path no label is read. <code>block()</code> refits its vectorisers on the test texts, so the n-gram vocabulary of the unseen country is learned from the test records themselves. Matches and the full candidate frame are converted to identifier lists and written in the same loop, so the matches are a subset of the candidates by construction.</p>
+  <aside class="note"><strong>Design note.</strong> The frame <code>fte</code> that feeds <code>model.predict()</code> is the one written as <code>candidate_pairs.tsv</code>, so the file documents the exact set the model scored, as the organisers define it.</aside>
+
+  <h2>4.5 Runtime environment and dependencies</h2>
+  <p>The intended host is a Kaggle CPU kernel: a Linux container with a fixed Python 3 image in which the libraries below are normally preinstalled (the <code>rapidfuzz</code> import is the only one guarded by an install fallback), the dataset mounted read-only under <code>/kaggle/input</code> and outputs written under <code>/kaggle/working</code>. The script also runs from a shell with <code>--data-dir</code>. No GPU is used; LightGBM parallelises over all cores through <code>n_jobs=-1</code>, while the rapidfuzz loops in <code>features()</code> run in one Python thread and dominate wall-clock time (see Chapter 12). Table 4.2 lists the dependencies as pinned in <code>requirements.txt</code>.</p>
+  <table class="tbl">
+    <caption>Table 4.2 — Runtime dependencies, their role in the pipeline and their licences.</caption>
+    <thead><tr><th>Package (minimum version)</th><th>Role in <code>er_pipeline.py</code></th><th>Licence</th></tr></thead>
+    <tbody>
+      <tr><td>numpy ≥ 1.24</td><td>Dense chunk scoring and <code>argpartition</code> in <code>topk_sparse()</code>, ternary state columns, the OOF vector, the threshold grid</td><td>BSD-3-Clause</td></tr>
+      <tr><td>pandas ≥ 2.0</td><td>All record and pair tables; TSV reading; group-by transforms for the contextual features and for <code>decode_table()</code></td><td>BSD-3-Clause</td></tr>
+      <tr><td>scipy ≥ 1.10</td><td>CSR sparse matrices returned by the vectorisers; sparse products (<code>@</code>, <code>.T.tocsr()</code>, <code>.multiply()</code>) in blocking</td><td>BSD-3-Clause</td></tr>
+      <tr><td>scikit-learn ≥ 1.3</td><td><code>TfidfVectorizer</code> (char_wb 2–4-grams) and <code>GroupKFold</code></td><td>BSD-3-Clause</td></tr>
+      <tr><td>lightgbm ≥ 4.0</td><td>The matching model: <code>lgb.train</code>, <code>lgb.Dataset</code>, <code>lgb.early_stopping</code>, gain importances</td><td>MIT</td></tr>
+      <tr><td>rapidfuzz ≥ 3.0</td><td><code>fuzz.ratio</code>, <code>token_sort_ratio</code>, <code>token_set_ratio</code>, <code>partial_ratio</code>, <code>JaroWinkler.similarity</code> in <code>features()</code></td><td>MIT</td></tr>
+      <tr><td>Python standard library</td><td><code>argparse</code>, <code>os</code>, <code>re</code>, <code>sys</code>, <code>time</code>, <code>unicodedata</code>, <code>glob</code></td><td>PSF</td></tr>
+    </tbody>
+  </table>
+  <p>The licence constraint applies to the <em>final model</em>, which must be MIT or Apache-2.0 licensed and at most eight billion parameters. The model is a LightGBM gradient-boosted tree ensemble, MIT licensed, of at most 63 leaves per tree and at most 2,200 trees (the refit grows <code>int(mean(best_iter) × 1.1)</code> rounds, and each fold's <code>best_iteration</code> is capped at 2,000); the BSD-licensed libraries are tooling, not models, and no pretrained weights are loaded. SciPy is not imported by name but enters through the sparse matrices scikit-learn returns, hence its pin in <code>requirements.txt</code>. The rapidfuzz import falls back to a <code>pip</code> install when the package is absent, the only network action the script can take, and it fetches a library, never data (see Chapter 13).</p>
+
+  <h2>4.6 Logging design</h2>
+  <p>All progress output goes through <code>log()</code>, which prefixes each message with the wall-clock seconds elapsed since import (<code>T0</code>), one decimal in a seven-character field, and flushes immediately so the Kaggle console shows lines as they happen. The prefix turns the log into a coarse profiler: the difference between consecutive lines is the cost of the stage between them. Multi-line frames use bare <code>print()</code>. Table 4.3 lists every line in emission order; the value column is a placeholder until the pipeline is run on the real data.</p>
+  <pre><code>def log(msg):
+    print(f"[{time.time() - T0:7.1f}s] {msg}", flush=True)</code></pre>
+  <table class="tbl">
+    <caption>Table 4.3 — Every log line emitted by a full run, in order, with its diagnostic purpose. Values are to be filled from the run log.</caption>
+    <thead><tr><th>Line (template)</th><th>Emitted by</th><th>Diagnoses</th><th>Value</th></tr></thead>
+    <tbody>
+      <tr><td><code>data dir: …</code></td><td><code>main()</code></td><td>Which directory auto-detection or <code>--data-dir</code> resolved to</td><td>to be filled from the run log</td></tr>
+      <tr><td><code>== train: S1=…  S2+S3=…</code>, <code>S1 countries: {…}</code>, <code>S2/S3 countries: {…}</code>, <code>singletons: …  mean matches: …  max: …</code>, then three sample rows per frame</td><td><code>profile("train")</code></td><td>Corpus size, country mix, singleton fraction and match multiplicity that set the top-k budgets and the singleton stakes in the metric</td><td>to be filled from the run log</td></tr>
+      <tr><td><code>== test: …</code> with the same country lines (no singleton line)</td><td><code>profile("test")</code></td><td>Presence and size of the unseen country; source imbalance</td><td>to be filled from the run log</td></tr>
+      <tr><td><code>blocking: N pairs (x per S1)</code></td><td><code>block()</code> on train</td><td>Candidate volume and reduction ratio</td><td>to be filled from the run log</td></tr>
+      <tr><td><code>blocking recall ceiling: r  (pos=… / true=…)</code></td><td><code>main()</code></td><td>Fraction of ground-truth links that survive blocking; upper bound of pair recall</td><td>to be filled from the run log</td></tr>
+      <tr><td><code>S1 entities with &gt;=1 true match blocked: a/b</code></td><td><code>main()</code></td><td>Entity-level ceiling: every non-blocked entity is a guaranteed 0.0 in the macro average</td><td>to be filled from the run log</td></tr>
+      <tr><td><code>blocking recall by country: {…}</code></td><td><code>main()</code></td><td>Whether one country's noise defeats the views</td><td>to be filled from the run log</td></tr>
+      <tr><td><code>blocking recall by source: {…}</code></td><td><code>main()</code></td><td>Whether S2 or S3 is harder to recall</td><td>to be filled from the run log</td></tr>
+      <tr><td><code>fold k: best_iter=…</code> (one per fold)</td><td><code>main()</code></td><td>Early-stopping point per fold; stability of the fit</td><td>to be filled from the run log</td></tr>
+      <tr><td><code>OOF macro F0.5 = s at thr=… ratio=…</code></td><td><code>main()</code></td><td>The validation score and the selected operating point</td><td>to be filled from the run log</td></tr>
+      <tr><td><code>macro F0.5 if every candidate were predicted (no model; floor): …</code></td><td><code>main()</code></td><td>Score without a matcher; what the model must beat</td><td>to be filled from the run log</td></tr>
+      <tr><td><code>blocking oracle macro F0.5 (…; ceiling): …</code></td><td><code>main()</code></td><td>Score of a perfect matcher on the blocked pairs; gap to OOF is the matcher's loss</td><td>to be filled from the run log</td></tr>
+      <tr><td>Top-15 gain importances (frame)</td><td><code>print()</code></td><td>Which feature families the model relies on</td><td>to be filled from the run log</td></tr>
+      <tr><td><code>blocking: N pairs (x per S1)</code></td><td><code>block()</code> on test</td><td>Test candidate volume, comparable with train</td><td>to be filled from the run log</td></tr>
+      <tr><td><code>wrote …/matching_results.tsv</code>, <code>wrote …/candidate_pairs.tsv</code></td><td><code>main()</code></td><td>Output paths</td><td>to be filled from the run log</td></tr>
+      <tr><td><code>test: n/N S1 entities matched; by country: {…}</code></td><td><code>main()</code></td><td>Match rate per raw country label; sanity check that France is neither starved nor over-matched</td><td>to be filled from the run log</td></tr>
+    </tbody>
+  </table>
+  <p>The floor, ceiling and OOF lines are read together: the gap between the oracle ceiling and 1.0 is loss only a change in <code>block()</code> can recover, and the gap between the ceiling and the OOF score is loss attributable to the matcher and the decision rule. Because F<sub>0.5</sub> is precision-weighted and singletons score all-or-nothing, the floor is expected to be low even when recall is high.</p>
+
+  <h2>4.7 Configuration surface</h2>
+  <p>The pipeline exposes three command-line arguments and otherwise reads its configuration from literals in the source. <code>parse_known_args()</code> tolerates the <code>-f</code> argument Jupyter injects inside a notebook. Table 4.4 enumerates every tunable value with its location and is the reference for the sensitivity discussion in Chapter 14.</p>
+  <table class="tbl">
+    <caption>Table 4.4 — Configuration surface: command-line arguments and in-source constants.</caption>
+    <thead><tr><th>Item</th><th>Where</th><th>Value</th></tr></thead>
+    <tbody>
+      <tr><td><code>--data-dir</code></td><td>CLI</td><td>Directory containing <code>train/</code> and <code>test/</code>; auto-detected by <code>find_data_dir()</code> when omitted</td></tr>
+      <tr><td><code>--out-dir</code></td><td>CLI</td><td>Output directory, default <code>output</code>, created if missing</td></tr>
+      <tr><td><code>--folds</code></td><td>CLI</td><td>Number of <code>GroupKFold</code> splits, default 5</td></tr>
+      <tr><td>Top-k per view</td><td><code>block()</code> defaults</td><td><code>k_name=25</code>, <code>k_full=25</code>, <code>k_addr=10</code>, <code>k_postal=10</code></td></tr>
+      <tr><td>Cosine cutoff</td><td><code>block()</code></td><td>Pairs kept only if score <code>&gt; 0.05</code></td></tr>
+      <tr><td>TF-IDF</td><td><code>block()</code></td><td><code>analyzer="char_wb"</code>, <code>ngram_range=(2, 4)</code>, <code>min_df=2</code>, <code>sublinear_tf=True</code>, <code>dtype=float32</code></td></tr>
+      <tr><td>Memory bounds</td><td><code>topk_sparse()</code>, <code>pair_cos()</code></td><td><code>max_cells=2e7</code> (chunk = max(16, max_cells // |B|)); <code>chunk=200_000</code> pairs</td></tr>
+      <tr><td>LightGBM <code>params</code></td><td><code>main()</code></td><td><code>objective="binary"</code>, <code>learning_rate=0.05</code>, <code>num_leaves=63</code>, <code>min_child_samples=40</code>, <code>feature_fraction=0.8</code>, <code>bagging_fraction=0.8</code>, <code>bagging_freq=1</code>, <code>lambda_l2=1.0</code>, <code>verbose=-1</code>, <code>n_jobs=-1</code></td></tr>
+      <tr><td>Boosting budget</td><td><code>main()</code></td><td>2000 rounds, early stopping patience 100 on the held-out fold; refit with <code>int(mean(best_iter) × 1.1)</code></td></tr>
+      <tr><td>Decision grid</td><td><code>main()</code></td><td><code>ratio ∈ {0.0, 0.6, 0.7, 0.8, 0.9, 1.0}</code>; <code>thr ∈ arange(0.20, 0.96, 0.025)</code>, i.e. 31 values from 0.200 to 0.950; 186 evaluations of <code>macro_f05()</code>; initial best <code>(0.5, 0.0)</code></td></tr>
+      <tr><td>Lookup tables and regexes</td><td>Module level</td><td><code>NAME_ABBR</code> (18 entries), <code>LEGAL</code> (26 tokens), <code>ADDR_ABBR</code> (41 entries), <code>ADDR_STOP</code> (16 tokens), <code>_postal</code>, <code>_dotted</code>, <code>_ALIAS</code></td></tr>
+    </tbody>
+  </table>
+  <p>Two values are deliberately <em>not</em> configuration: <code>(best_thr, best_ratio)</code> and the refit round count are learned in every run and never stored, so a reproduction cannot reuse stale parameters. <code>params</code> sets no explicit <code>seed</code> and no <code>deterministic</code> flag: LightGBM falls back to its built-in default seeds for bagging and feature subsampling, which keeps a single-threaded run repeatable, but <code>n_jobs=-1</code> lets histogram construction be split across threads in an order that can vary between machines and builds, so repeated runs may differ in the last decimals of the OOF score; Chapter 11 gives the <code>params</code> additions that make a run bit-exact.</p>
+  <aside class="warn"><strong>Risk.</strong> Because every constant is a literal in the source, a change to one view's <code>k</code> or to the grid range is invisible from the CLI. Any tuning must be recorded in the run log and in Chapter 15, and the ceiling and floor lines of Table 4.3 re-read after each change: a higher <code>k</code> can only raise the ceiling and lower the floor, and under the precision-weighted metric it is expected to move the selected <code>thr</code> as well, so the sweep must be re-run rather than the previous operating point reused.</aside>
+</section>

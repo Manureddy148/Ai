@@ -1,0 +1,213 @@
+<section class="chapter" id="ch-10">
+  <h1><span class="num">10</span> Validation Strategy and Tooling</h1>
+  <p class="lead">The test set carries no labels, so every number that guides a design decision comes from the training split. This chapter describes the grouped out-of-fold (OOF) protocol inside <code>main()</code> and its diagnostics, the stand-alone scorer <code>utils/score.py</code>, the addition needed to feed it a train-side prediction file, the validator <code>utils/validate_submission.py</code> and every rule it enforces, an error-analysis playbook, and the pre-upload checklist. Throughout, macro F<sub>0.5</sub> with all-or-nothing singletons is measured exactly as the organisers compute it, on entities the model has never seen.</p>
+
+  <h2>10.1 Validation protocol</h2>
+  <h3>10.1.1 Grouped out-of-fold predictions</h3>
+  <p>The problem statement asks participants to hold out part of the training data and score it with the F<sub>0.5</sub> formula (see Chapter 2). The pipeline uses K-fold cross-validation instead of a single hold-out, so that every training pair is scored by a model that never saw it. <code>main()</code> splits the labelled candidate table <code>ftr</code> with <code>GroupKFold(args.folds)</code>, five folds by default, grouped by <code>ftr.i1</code>, the S1 row index. Grouping by S1 entity is essential: the contextual features of Chapter 7 (<code>cos_full_gap1</code>, <code>rank1</code>, <code>n_cand1</code> and their siblings) and the decision rule of Chapter 9 both act on the whole candidate set of one S1 entity. Spreading that set across folds would overstate what happens on the test set, where every S1 entity is new.</p>
+  <p>Within each fold, LightGBM trains for at most 2,000 rounds with early stopping after 100 rounds without improvement of the held-out log-loss (see Chapter 8). The held-out predictions at <code>best_iteration</code> fill the vector <code>oof</code>; the final refit uses <code>int(np.mean(iters) * 1.1)</code> rounds, so the OOF run also fixes the capacity of the deployed model.</p>
+  <h3>10.1.2 Scoring the OOF predictions with the official metric</h3>
+  <p>The OOF probabilities are decoded exactly as test probabilities are: <code>decode_table(ftr, oof)</code> assigns each S2/S3 record to its highest-probability S1 and records the per-(S1, source) maximum, and <code>decide()</code> applies the absolute threshold <code>thr</code> and the relative bar <code>ratio · best</code>. For each of the 186 grid points (six ratios in {0.0, 0.6, 0.7, 0.8, 0.9, 1.0}, thirty-one thresholds from 0.20 to 0.95 in steps of 0.025), <code>to_lists()</code> builds per-entity id lists and <code>macro_f05()</code> averages <code>f05()</code> over <code>tr1.entity_id.values</code>. The key set is every training S1 entity, not only those with candidates, so an entity whose true matches were never blocked contributes 0.0 and singletons contribute 1.0 or 0.0: blocking loss and the singleton penalty are inside the estimate. <code>f05()</code> implements the challenge rule literally: empty truth scores 1.0 if and only if the prediction is empty, an empty prediction against non-empty truth scores 0.0, zero true positives score 0.0, otherwise F<sub>0.5</sub> = 1.25·P·R / (0.25·P + R). The best grid point is logged as <code>OOF macro F0.5 = … at thr=… ratio=…</code>, the primary estimate of the leaderboard score.</p>
+  <aside class="note"><strong>Design note.</strong> The OOF number is a tuned score, not an untouched hold-out: <code>(thr, ratio)</code> is chosen by maximising it over 186 points. With only two free parameters selected against the full set of training S1 entities the optimistic bias is expected to be small, but the public leaderboard should be expected to sit slightly lower even for US and India, before any effect of the unseen French records.</aside>
+  <p>Two things lie outside this protocol. The TF-IDF vectorisers and the contextual features are computed on the full training split before folding; they use no labels, and <code>block()</code> refits the vectorisers on test text in the same way, so this mirrors inference rather than leaking. France has no labels, so the only check for the unseen country is the per-country fraction of test S1 entities that received a match, printed as the last line of <code>main()</code> (see Chapter 14).</p>
+
+  <h2>10.2 Diagnostics printed by main()</h2>
+  <p>Every quantity a design decision depends on is written by <code>log()</code> with a wall-clock prefix (only the feature-importance table and the data previews of <code>profile()</code> go through a plain <code>print()</code>), so one run log is a complete validation record. Figure 10.1 places these lines in the loop that connects them to the two utilities; Table 10.4 lists the values to be recorded once the pipeline has run.</p>
+  <ul>
+    <li><code>profile()</code>: record counts, country distributions and, for train, the singleton fraction and the mean and maximum matches per entity. With singleton fraction <em>s</em>, merging one in every hundred singletons removes <em>s</em>/100 from the macro average.</li>
+    <li><code>block()</code>: candidate pairs and pairs per S1 entity, from which the reduction ratio of Chapter 6 follows.</li>
+    <li>The <em>blocking recall ceiling</em>, the number of non-singleton S1 entities with at least one true match blocked (the macro metric charges 0.0 for every such entity with none), and recall by country and by source.</li>
+    <li>One <code>fold k: best_iter=…</code> line per fold; widely differing values indicate an unstable fit.</li>
+    <li>The OOF macro F<sub>0.5</sub> line, the <em>floor</em> (every candidate predicted) and the <em>oracle ceiling</em> (exactly the true candidate pairs). OOF-to-oracle is what the matcher and decision layer leave on the table; oracle-to-1.0 is what only better blocking can recover.</li>
+    <li>The fifteen highest gain importances of the refit model, and the test-side match count with the per-country match rate.</li>
+  </ul>
+  <figure>
+    <svg viewBox="0 0 800 440" width="100%" font-family="inherit" font-size="13" fill="#0f172a">
+      <defs>
+        <marker id="ch10-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="#334155"/>
+        </marker>
+      </defs>
+      <!-- row 1: train path -->
+      <rect x="20" y="24" width="170" height="60" rx="6" fill="#e2e8f0" stroke="#334155"/>
+      <text x="32" y="46" font-weight="bold">train TSVs + truth</text>
+      <text x="32" y="64">prep, block, features</text>
+      <text x="32" y="78">labels y from gt</text>
+      <line x1="190" y1="54" x2="222" y2="54" stroke="#334155" stroke-width="1.5" marker-end="url(#ch10-arrow)"/>
+      <rect x="225" y="24" width="170" height="60" rx="6" fill="#dbeafe" stroke="#334155"/>
+      <text x="237" y="46" font-weight="bold">GroupKFold(5) by i1</text>
+      <text x="237" y="64">early stopping 100</text>
+      <text x="237" y="78">oof[b] = predict</text>
+      <line x1="395" y1="54" x2="427" y2="54" stroke="#334155" stroke-width="1.5" marker-end="url(#ch10-arrow)"/>
+      <rect x="430" y="24" width="170" height="60" rx="6" fill="#dbeafe" stroke="#334155"/>
+      <text x="442" y="46" font-weight="bold">decode_table(ftr, oof)</text>
+      <text x="442" y="64">186-point sweep</text>
+      <text x="442" y="78">argmax macro_f05</text>
+      <line x1="600" y1="54" x2="632" y2="54" stroke="#334155" stroke-width="1.5" marker-end="url(#ch10-arrow)"/>
+      <rect x="635" y="24" width="145" height="60" rx="6" fill="#fef3c7" stroke="#334155"/>
+      <text x="647" y="46" font-weight="bold">run log</text>
+      <text x="647" y="64">OOF F0.5, ceiling,</text>
+      <text x="647" y="78">floor, oracle, recall</text>
+      <!-- row 2: suggested OOF file + scorer -->
+      <line x1="515" y1="84" x2="515" y2="126" stroke="#334155" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#ch10-arrow)"/>
+      <rect x="430" y="130" width="170" height="60" rx="6" fill="#f1f5f9" stroke="#334155" stroke-dasharray="5 4"/>
+      <text x="442" y="152" font-weight="bold">suggested addition</text>
+      <text x="442" y="170">train_oof_matching.tsv</text>
+      <text x="442" y="184">train_candidates.tsv</text>
+      <line x1="430" y1="160" x2="398" y2="160" stroke="#334155" stroke-width="1.5" marker-end="url(#ch10-arrow)"/>
+      <rect x="225" y="130" width="170" height="60" rx="6" fill="#dcfce7" stroke="#334155"/>
+      <text x="237" y="152" font-weight="bold">utils/score.py</text>
+      <text x="237" y="170">--truth --source1 --by-size</text>
+      <text x="237" y="184">macro, micro, singletons</text>
+      <line x1="225" y1="160" x2="193" y2="160" stroke="#334155" stroke-width="1.5" marker-end="url(#ch10-arrow)"/>
+      <rect x="20" y="130" width="170" height="60" rx="6" fill="#fee2e2" stroke="#334155"/>
+      <text x="32" y="152" font-weight="bold">error slices</text>
+      <text x="32" y="170">country, size 0/1/2/3+,</text>
+      <text x="32" y="184">source, failure class</text>
+      <!-- feedback arrow up to train stage -->
+      <path d="M105,130 L105,84" stroke="#334155" stroke-width="1.5" fill="none" marker-end="url(#ch10-arrow)"/>
+      <text x="112" y="112">adjust tables, k, features</text>
+      <!-- row 3: test path -->
+      <rect x="20" y="250" width="170" height="60" rx="6" fill="#e2e8f0" stroke="#334155"/>
+      <text x="32" y="272" font-weight="bold">test TSVs</text>
+      <text x="32" y="290">prep, block, features</text>
+      <text x="32" y="304">model.predict</text>
+      <line x1="190" y1="280" x2="222" y2="280" stroke="#334155" stroke-width="1.5" marker-end="url(#ch10-arrow)"/>
+      <rect x="225" y="250" width="170" height="60" rx="6" fill="#dbeafe" stroke="#334155"/>
+      <text x="237" y="272" font-weight="bold">decide(thr*, ratio*)</text>
+      <text x="237" y="290">to_lists + writer</text>
+      <text x="237" y="304">two TSVs in out-dir</text>
+      <line x1="395" y1="280" x2="427" y2="280" stroke="#334155" stroke-width="1.5" marker-end="url(#ch10-arrow)"/>
+      <rect x="430" y="250" width="170" height="60" rx="6" fill="#dcfce7" stroke="#334155"/>
+      <text x="442" y="272" font-weight="bold">validate_submission.py</text>
+      <text x="442" y="290">13 rules (Table 10.1)</text>
+      <text x="442" y="304">exit 0 PASS / 1 FAILED</text>
+      <line x1="600" y1="280" x2="632" y2="280" stroke="#334155" stroke-width="1.5" marker-end="url(#ch10-arrow)"/>
+      <rect x="635" y="250" width="145" height="60" rx="6" fill="#fef3c7" stroke="#334155"/>
+      <text x="647" y="272" font-weight="bold">upload</text>
+      <text x="647" y="290">matching_results.tsv</text>
+      <text x="647" y="304">only on exit 0</text>
+      <!-- thr/ratio transfer arrow -->
+      <path d="M515,190 L515,220 L310,220 L310,247" stroke="#334155" stroke-width="1.5" fill="none" marker-end="url(#ch10-arrow)"/>
+      <text x="320" y="214">thr*, ratio*, refit model (train only)</text>
+      <!-- legend -->
+      <rect x="20" y="360" width="16" height="16" rx="3" fill="#dbeafe" stroke="#334155"/>
+      <text x="42" y="373">er_pipeline.py stage</text>
+      <rect x="200" y="360" width="16" height="16" rx="3" fill="#dcfce7" stroke="#334155"/>
+      <text x="222" y="373">stdlib utility</text>
+      <rect x="340" y="360" width="16" height="16" rx="3" fill="#f1f5f9" stroke="#334155" stroke-dasharray="5 4"/>
+      <text x="362" y="373">not yet in the code</text>
+      <rect x="520" y="360" width="16" height="16" rx="3" fill="#fee2e2" stroke="#334155"/>
+      <text x="542" y="373">analysis (manual)</text>
+      <text x="20" y="410">Test labels are never read; only thr*, ratio* and the refit model cross from the top row to the bottom row.</text>
+    </svg>
+    <figcaption>Figure 10.1 — The validation loop. Top row: the training-side estimate produced by <code>main()</code>; dashed box: the suggested train-side prediction file that lets <code>utils/score.py</code> break the OOF score down; bottom row: the test-side path that ends in <code>utils/validate_submission.py</code> and, only on exit code 0, an upload.</figcaption>
+  </figure>
+
+  <table class="tbl">
+    <caption>Table 10.4 — Validation quantities to be filled from the run log (the pipeline has not yet been executed on the challenge data; no value below is measured).</caption>
+    <thead><tr><th>Log line</th><th>Quantity</th><th>Value</th></tr></thead>
+    <tbody>
+      <tr><td><code>== train:</code></td><td>S1 / S2+S3 counts, singleton fraction, mean and max matches</td><td>to be filled from the run log</td></tr>
+      <tr><td><code>blocking:</code></td><td>candidate pairs, pairs per S1 (train and test)</td><td>to be filled from the run log</td></tr>
+      <tr><td><code>blocking recall ceiling:</code></td><td>true pairs blocked / total true pairs</td><td>to be filled from the run log</td></tr>
+      <tr><td><code>S1 entities with &gt;=1 true match blocked:</code></td><td>entities not charged 0.0 by blocking</td><td>to be filled from the run log</td></tr>
+      <tr><td><code>blocking recall by country / by source:</code></td><td>per-country and S2/S3 recall</td><td>to be filled from the run log</td></tr>
+      <tr><td><code>fold k: best_iter=</code></td><td>five early-stopping iterations</td><td>to be filled from the run log</td></tr>
+      <tr><td><code>OOF macro F0.5 =</code></td><td>primary estimate, <code>thr</code>, <code>ratio</code></td><td>to be filled from the run log</td></tr>
+      <tr><td><code>floor</code> / <code>ceiling</code> lines</td><td>all-candidates macro F<sub>0.5</sub>; blocking-oracle macro F<sub>0.5</sub></td><td>to be filled from the run log</td></tr>
+      <tr><td><code>test: … matched; by country:</code></td><td>match rate per test country incl. France</td><td>to be filled from the run log</td></tr>
+    </tbody>
+  </table>
+
+  <h2>10.3 The scorer: utils/score.py</h2>
+  <p><code>utils/score.py</code> is a standard-library-only re-implementation of the metric, kept separate from the pipeline so that the two implementations of <code>f05()</code> can be checked against each other. It takes <code>--pred</code> and <code>--truth</code>, both two-column TSVs in the submission format, an optional <code>--source1</code> file that supplies each S1 entity's country, and the flag <code>--by-size</code>. <code>read_lists()</code> skips the header, strips whitespace and treats a blank or absent second column as an empty set; <code>read_country()</code> maps a blank country to <code>UNKNOWN</code> rather than dropping the entity, consistent with the open-set treatment of Chapter 6.</p>
+  <p>The scorer iterates over the entities of the <em>truth</em> file: an entity missing from the prediction file is scored as empty, and a predicted entity absent from the truth is ignored; both cases print a warning on stderr. The pipeline's <code>macro_f05()</code> iterates over <code>tr1.entity_id</code> instead, so the two agree only when the ground-truth file has a row for every training S1 entity, singletons included. Table 10.2 lists the scorer's output.</p>
+  <table class="tbl">
+    <caption>Table 10.2 — Outputs of <code>utils/score.py</code> and their meaning.</caption>
+    <thead><tr><th>Line</th><th>Computation</th><th>How to read it</th></tr></thead>
+    <tbody>
+      <tr><td>Entities scored</td><td>number of truth rows</td><td>must equal the S1 count of the split; otherwise the truth file is incomplete</td></tr>
+      <tr><td>Macro F<sub>0.5</sub></td><td>mean of per-entity <code>f05()</code></td><td>the leaderboard quantity; must reproduce the log's OOF line for the train-OOF file</td></tr>
+      <tr><td>Micro precision</td><td>tp / (tp + fp) over all predicted ids</td><td>pair-level view; an entity with many matches weighs many times more than in the macro score</td></tr>
+      <tr><td>Micro recall</td><td>tp / (tp + fn)</td><td>with micro precision, shows whether loss is precision- or recall-driven</td></tr>
+      <tr><td>Singleton accuracy</td><td>singletons predicted empty / singletons</td><td>each miss costs a full 1.0 for that entity; the most expensive error class under the metric</td></tr>
+      <tr><td>False merges (singl.)</td><td>singletons with a non-empty prediction</td><td>direct count of the errors the threshold should suppress first</td></tr>
+      <tr><td>Per-country F<sub>0.5</sub></td><td>macro within each country of <code>--source1</code>, sorted by size</td><td>reveals whether one country dominates the loss; <code>UNKNOWN</code> collects blank labels</td></tr>
+      <tr><td>F<sub>0.5</sub> by truth list size</td><td>buckets 0, 1, 2, 3+ of the truth list length</td><td>bucket 0 is singleton accuracy; a weak 3+ bucket implicates the <code>ratio</code> rule or <code>drop_duplicates("i2")</code></td></tr>
+    </tbody>
+  </table>
+  <p>The micro figures are reported on purpose: under macro averaging an entity with twelve true matches and one with a single match count equally, so micro precision can look healthy while many small entities each lose one pair.</p>
+
+  <h2>10.4 Producing a train-OOF prediction file (suggested addition)</h2>
+  <p>The pipeline currently writes only the two test-side files. Everything needed for a train-side file already exists in <code>main()</code> after the sweep: <code>dtr</code> holds the decoded OOF table, <code>best_thr</code> and <code>best_ratio</code> the operating point, and <code>cand_lists</code> the training candidate lists. The addition below, which is <strong>not yet part of <code>er_pipeline.py</code></strong>, writes both under names that cannot be confused with the submission files, reusing the writer loop of the test path.</p>
+  <pre><code>oof_lists = to_lists(decide(dtr, best_thr, best_ratio), tr1, tr2)
+for fname, col, lists in [("train_oof_matching.tsv", "matched_entity_ids", oof_lists),
+                          ("train_candidates.tsv", "candidate_entity_ids", cand_lists)]:
+    path = os.path.join(args.out_dir, fname)
+    with open(path, "w", newline="") as fh:
+        fh.write(f"source1_entity_id\t{col}\n")
+        for e in tr1.entity_id.values:
+            fh.write(f"{e}\t{','.join(dict.fromkeys(lists[e]))}\n")
+    log(f"wrote {path}")
+# then, from the repository root:
+#   python3 utils/score.py --pred output/train_oof_matching.tsv \
+#       --truth dataset/train/train_ground_truth.tsv \
+#       --source1 dataset/train/train_source1.tsv --by-size</code></pre>
+  <p>Scoring <code>train_oof_matching.tsv</code> must reproduce the log's OOF macro F<sub>0.5</sub> to its four printed digits, provided the truth file has a row for every training S1 entity; any other discrepancy means one of the two <code>f05()</code> implementations has drifted. The candidate file lets Section 10.6 separate blocking misses from matcher misses. Neither file belongs in the submission package, and the validator is never pointed at them, because their ids are training ids.</p>
+
+  <h2>10.5 The validator: utils/validate_submission.py</h2>
+  <p>A submission that violates any format rule is rejected and consumes a submission slot, so <code>utils/validate_submission.py</code> checks both output files against the test source files before anything is uploaded. <code>load_test_ids()</code> reads the three test TSVs, requires each to begin with an <code>entity_id</code> header, and builds the set of S1 ids and the set of S2/S3 ids. <code>validate_file()</code> parses one submission file on the raw text rather than through a CSV reader, so that quoting characters and padded tokens are detected instead of silently absorbed. Table 10.1 lists every rule.</p>
+  <table class="tbl">
+    <caption>Table 10.1 — Rules enforced by <code>utils/validate_submission.py</code>, in the order they are checked.</caption>
+    <thead><tr><th>#</th><th>Rule</th><th>Scope</th><th>Outcome</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>each test source file starts with an <code>entity_id</code> header</td><td>test dir</td><td>immediate exit with message (exit 1)</td></tr>
+      <tr><td>2</td><td>submission file is not empty</td><td>file</td><td>issue</td></tr>
+      <tr><td>3</td><td>header is exactly <code>source1_entity_id</code> TAB <code>matched_entity_ids</code> (or <code>candidate_entity_ids</code>)</td><td>file</td><td>issue</td></tr>
+      <tr><td>4</td><td>every non-empty row has exactly two tab-separated columns (empty lines are skipped)</td><td>row</td><td>issue; row skipped for further checks</td></tr>
+      <tr><td>5</td><td>no <code>"</code> or <code>'</code> anywhere in the line</td><td>row</td><td>issue</td></tr>
+      <tr><td>6</td><td>no duplicate <code>source1_entity_id</code></td><td>row</td><td>issue</td></tr>
+      <tr><td>7</td><td><code>source1_entity_id</code> exists in <code>test_source1.tsv</code></td><td>row</td><td>issue</td></tr>
+      <tr><td>8</td><td>no empty or whitespace-padded token in the id list</td><td>token</td><td>issue; token skipped</td></tr>
+      <tr><td>9</td><td>every id starts with <code>S2-</code> or <code>S3-</code> (rejects S1 self-matches)</td><td>token</td><td>issue</td></tr>
+      <tr><td>10</td><td>every id exists in <code>test_source2.tsv</code> or <code>test_source3.tsv</code></td><td>token</td><td>issue</td></tr>
+      <tr><td>11</td><td>no id repeated within one list</td><td>token</td><td>issue</td></tr>
+      <tr><td>12</td><td>every test S1 id has a row (completeness)</td><td>file</td><td>one issue per missing id</td></tr>
+      <tr><td>13</td><td>matched ids are a subset of the candidate ids of the same S1 entity</td><td>cross-check</td><td>issue when <code>--candidate</code> is given; warning that the rule was not checked otherwise</td></tr>
+    </tbody>
+  </table>
+  <p>After parsing, <code>print_stats()</code> writes one line per file with the row count, the entities with at least one id, the total number of ids and the average list length. These are the first sanity check on a new run: a matching file whose average list length exceeds the training mean matches, or whose share of matched entities is far from the training non-singleton fraction, is suspect before any score is known. The program prints <code>PASS</code> with exit code 0 when no issue was recorded, or <code>FAILED: n issue(s) found</code> with a numbered list capped at <code>MAX_SHOWN = 50</code> and exit code 1, so the notebook of Chapter 11 can gate the upload on the exit code alone.</p>
+  <h3>10.5.1 Difference to the official validator</h3>
+  <p>The official helper, as described in the problem statement, treats a matched id that never appeared as a candidate as a <em>warning</em>; this validator treats it as an <em>error</em>. The pipeline satisfies the subset property by construction, since <code>decide()</code> only selects rows of the blocked candidate table and both files are written from the same <code>fte</code> frame, so a violation can only come from a packaging bug, files from two different runs or a hand edit, which the problem statement itself calls a pipeline bug. Promoting the check to a failure ensures it cannot be scrolled past. When the candidate file is omitted, the validator prints a <code>WARNING</code> rather than a clean pass, because the subset rule is part of what the organisers audit (see Chapter 13).</p>
+  <aside class="warn"><strong>Risk.</strong> A stale or partial copy of the test set under <code>--test-dir</code> makes rule 10 fail for every id the copy lacks or, worse, lets rule 12 pass on an incomplete submission. Table 10.3 therefore requires that the validator and the pipeline read the same <code>dataset/test</code> directory.</aside>
+
+  <h2>10.6 Error-analysis playbook</h2>
+  <p>With <code>train_oof_matching.tsv</code>, <code>train_candidates.tsv</code>, the ground truth and <code>train_source1.tsv</code> in hand, failures are attributed in a fixed order.</p>
+  <ol>
+    <li><strong>By country.</strong> Run the scorer with <code>--source1</code>. If the weaker country's blocking recall in the log also trails, the cause lies in normalisation or blocking (the abbreviation tables, the postal regex <code>_postal</code>, the top-k of the address view), not in the model.</li>
+    <li><strong>By truth size.</strong> Run with <code>--by-size</code>. A weak bucket 0 means false merges: raise <code>thr</code> or inspect the features that let a singleton's best candidate pass. A weak bucket 1 with healthy blocking recall means the matcher ranks the true record below the threshold. A weak 3+ bucket implicates the relative rule (<code>p &lt; ratio · best</code>) or the assignment in <code>decode_table()</code>.</li>
+    <li><strong>By source.</strong> The scorer has no source flag; restrict both truth and prediction lists to ids beginning with <code>S2-</code> (then <code>S3-</code>) and score each restriction. Read with the <code>blocking recall by source</code> log line, this shows whether S3's field quality (feature <code>is_s3</code>) warrants its own operating point (see Chapter 14).</li>
+    <li><strong>By failure class.</strong> For each entity scoring below 1.0, classify each missing true id as a <em>blocking miss</em> (absent from <code>train_candidates.tsv</code>), a <em>threshold miss</em> (below <code>thr</code>), a <em>ratio suppression</em> (below <code>ratio · best</code>) or an <em>assignment loss</em> (given to another S1 by <code>drop_duplicates("i2")</code>); classify each spurious id as a <em>singleton merge</em> or an <em>over-inclusion</em>. The last two are the classes F<sub>0.5</sub> penalises most and are read next to the raw strings to find the noise pattern responsible (see Chapter 3).</li>
+  </ol>
+  <p>Every change to a table, a top-k or a feature is followed by a full rerun of the OOF loop, because the operating point is re-selected on the new probabilities and a gain in one bucket can move <code>thr</code> and cost singletons elsewhere.</p>
+
+  <h2>10.7 Pre-submission checklist</h2>
+  <table class="tbl">
+    <caption>Table 10.3 — Pre-submission checklist; every item must hold before <code>matching_results.tsv</code> is uploaded or the package is zipped.</caption>
+    <thead><tr><th>#</th><th>Check</th><th>Evidence</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>The run log shows all diagnostics of Table 10.4 and no Python traceback</td><td>log file kept with the outputs</td></tr>
+      <tr><td>2</td><td>OOF macro F<sub>0.5</sub> is not lower than the previous accepted run</td><td><code>OOF macro F0.5 =</code> line compared with the run history</td></tr>
+      <tr><td>3</td><td>Scorer on <code>train_oof_matching.tsv</code> reproduces the log's OOF value</td><td><code>utils/score.py</code> output</td></tr>
+      <tr><td>4</td><td>Singleton accuracy and per-country F<sub>0.5</sub> show no collapse in any slice</td><td>scorer breakdowns</td></tr>
+      <tr><td>5</td><td>Test match rate per country, including France, is plausible relative to the training non-singleton fraction</td><td>last <code>test:</code> log line</td></tr>
+      <tr><td>6</td><td><code>validate_submission.py</code> run with <em>both</em> files and the same <code>dataset/test</code> the pipeline read prints <code>PASS</code> (exit 0)</td><td>terminal output</td></tr>
+      <tr><td>7</td><td>Statistics lines: rows equal the test S1 count; matching avg list length does not exceed the candidate avg list length</td><td>validator <code>[matching]</code> and <code>[candidate]</code> lines</td></tr>
+      <tr><td>8</td><td>Both TSVs come from the same run and were not hand-edited</td><td>file mtimes, <code>wrote …</code> log lines</td></tr>
+      <tr><td>9</td><td>No training-side files (<code>train_oof_matching.tsv</code>, <code>train_candidates.tsv</code>) are inside <code>output/</code> of the package</td><td>zip listing (see Chapter 11)</td></tr>
+      <tr><td>10</td><td>No external data source was read; the only inputs are the train and test TSVs</td><td>review of <code>load_split()</code> and <code>find_data_dir()</code> (see Chapter 13)</td></tr>
+    </tbody>
+  </table>
+  <p>A submission that fails any item is not uploaded; the OOF estimate read through the breakdowns above, not the leaderboard, is the instrument that guides development.</p>
+</section>

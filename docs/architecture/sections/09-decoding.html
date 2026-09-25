@@ -1,0 +1,199 @@
+<section class="chapter" id="ch-09">
+  <h1><span class="num">9</span> Decision Layer: From Probabilities to Match Lists</h1>
+  <p class="lead">The matcher of Chapter 8 emits one probability per candidate pair; the leaderboard scores one list per Source 1 (S1) entity. This chapter describes the layer between the two: <code>decode_table()</code>, which assigns each Source 2 / Source 3 (S2/S3) record to the S1 entity that scores it highest and records the best probability per (S1, source) group; <code>decide()</code>, which keeps a pair only if it clears an absolute threshold <code>thr</code> and a relative bar <code>ratio · best</code>; the 186-point out-of-fold (OOF) grid that selects both parameters by maximising macro F<sub>0.5</sub> including singletons; and <code>to_lists()</code> with the TSV writer. It derives from the metric why a second candidate must be nearly as confident as the first to be worth adding.</p>
+
+  <h2>9.1 Role of the decision layer</h2>
+  <p>The metric is macro-averaged over S1 entities (see Chapter 2): each contributes one F<sub>0.5</sub> computed from its predicted and ground-truth lists, and a singleton, an S1 entity with no true match, contributes 1.0 if and only if its predicted list is empty. The matcher is trained with a pairwise log-loss and knows nothing about lists, singletons or the precision-recall asymmetry; all of that is handled after the model, in <code>decode_table()</code>, <code>decide()</code>, <code>to_lists()</code> and the writer loop of <code>main()</code>. Because the metric logic sits in a small parameterised layer, the expensive stages run once and the operating point is re-selected cheaply from stored OOF probabilities. Figure 9.1 shows the flow.</p>
+  <figure>
+    <svg viewBox="0 0 800 330" width="100%" font-family="inherit" font-size="13" fill="#0f172a">
+      <defs>
+        <marker id="ch09-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="#334155"/>
+        </marker>
+      </defs>
+      <!-- row 1 -->
+      <rect x="20" y="30" width="230" height="64" rx="6" fill="#e2e8f0" stroke="#334155"/>
+      <text x="32" y="52" font-weight="bold">scored pairs</text>
+      <text x="32" y="70">f[i1, i2, is_s3] + p = prob</text>
+      <text x="32" y="86">one row per blocked pair</text>
+      <line x1="250" y1="62" x2="282" y2="62" stroke="#334155" stroke-width="1.5" marker-end="url(#ch09-arrow)"/>
+      <rect x="285" y="30" width="230" height="64" rx="6" fill="#dbeafe" stroke="#334155"/>
+      <text x="297" y="52" font-weight="bold">sort_values("p", desc)</text>
+      <text x="297" y="70">strongest pair of every</text>
+      <text x="297" y="86">S2/S3 record comes first</text>
+      <line x1="515" y1="62" x2="547" y2="62" stroke="#334155" stroke-width="1.5" marker-end="url(#ch09-arrow)"/>
+      <rect x="550" y="30" width="230" height="64" rx="6" fill="#dbeafe" stroke="#334155"/>
+      <text x="562" y="52" font-weight="bold">drop_duplicates("i2")</text>
+      <text x="562" y="70">each S2/S3 record kept for</text>
+      <text x="562" y="86">its highest-p S1 only</text>
+      <!-- down arrow -->
+      <line x1="665" y1="94" x2="665" y2="136" stroke="#334155" stroke-width="1.5" marker-end="url(#ch09-arrow)"/>
+      <!-- row 2 (right to left) -->
+      <rect x="550" y="140" width="230" height="64" rx="6" fill="#dbeafe" stroke="#334155"/>
+      <text x="562" y="162" font-weight="bold">best = groupby(i1, is_s3)</text>
+      <text x="562" y="180">.p.transform("max")</text>
+      <text x="562" y="196">per (S1, source) maximum</text>
+      <line x1="550" y1="172" x2="518" y2="172" stroke="#334155" stroke-width="1.5" marker-end="url(#ch09-arrow)"/>
+      <rect x="285" y="140" width="230" height="64" rx="6" fill="#fef3c7" stroke="#334155"/>
+      <text x="297" y="162" font-weight="bold">decide(d, thr, ratio)</text>
+      <text x="297" y="180">keep iff p &gt;= thr</text>
+      <text x="297" y="196">and p &gt;= ratio · best</text>
+      <line x1="285" y1="172" x2="253" y2="172" stroke="#334155" stroke-width="1.5" marker-end="url(#ch09-arrow)"/>
+      <rect x="20" y="140" width="230" height="64" rx="6" fill="#dcfce7" stroke="#334155"/>
+      <text x="32" y="162" font-weight="bold">to_lists() + writer</text>
+      <text x="32" y="180">{S1 id: [S2/S3 ids]} in p order</text>
+      <text x="32" y="196">matching_results.tsv</text>
+      <!-- parameter source -->
+      <rect x="285" y="250" width="230" height="60" rx="6" fill="#f1f5f9" stroke="#334155"/>
+      <text x="297" y="272" font-weight="bold">OOF grid (train only)</text>
+      <text x="297" y="290">6 ratios × 31 thresholds = 186</text>
+      <text x="297" y="304">argmax macro F0.5 incl. singletons</text>
+      <line x1="400" y1="250" x2="400" y2="208" stroke="#334155" stroke-width="1.5" marker-end="url(#ch09-arrow)"/>
+      <text x="410" y="232">(thr, ratio)</text>
+      <!-- bracket label -->
+      <text x="20" y="122" font-style="italic">decode_table(): threshold-independent, computed once per split</text>
+    </svg>
+    <figcaption>Figure 9.1 — Decode flow: <code>decode_table()</code> sorts, de-duplicates per S2/S3 record and computes the per-(S1, source) maximum once; <code>decide()</code> applies the two-part rule with parameters from the training OOF grid; <code>to_lists()</code> and the writer produce one line per S1 entity.</figcaption>
+  </figure>
+
+  <h2>9.2 <code>decode_table()</code>: assignment and group maxima</h2>
+  <p>The function takes the feature table <code>f</code> and the probability vector <code>prob</code> (OOF probabilities in training, the refitted model's predictions at test time) and returns a reduced table with columns <code>i1</code>, <code>i2</code>, <code>is_s3</code>, <code>p</code> and <code>best</code>:</p>
+  <pre><code>def decode_table(f, prob):
+    d = f[["i1", "i2", "is_s3"]].copy()
+    d["p"] = prob
+    d = d.sort_values("p", ascending=False).drop_duplicates("i2").reset_index(drop=True)
+    d["best"] = d.groupby(["i1", "is_s3"]).p.transform("max")
+    return d</code></pre>
+
+  <h3>9.2.1 One S1 entity per S2/S3 record</h3>
+  <p>Sorting by <code>p</code> descending and calling <code>drop_duplicates("i2")</code> keeps, for every S2/S3 row index <code>i2</code>, only the highest-probability pair. The justification is structural: Source 1 is the de-duplicated reference source, so two S1 entities are two different businesses, and one S2/S3 record can belong to at most one of them. Blocking (see Chapter 6) routinely retrieves the same S2/S3 record for several S1 entities (chain branches, franchises, common names); at most one can be right, every other is a false positive, and on a singleton it costs the full 1.0.</p>
+  <p>The step is a greedy assignment: when the matcher ranks the correct S1 entity highest, the competing false positives vanish at zero recall cost; when it ranks a wrong entity highest, the true owner loses the record to a false positive that a flat threshold would have produced anyway. The net effect is positive whenever the ranking across S1 entities beats chance, which the cross-record features <code>cos_full_gap2</code>, <code>rank2</code> and <code>n_cand2</code> of Chapter 7 support.</p>
+
+  <h3>9.2.2 The per-(S1, source) maximum</h3>
+  <p>After de-duplication, <code>best</code> is the maximum probability among the surviving pairs of the same S1 entity and source (S2 or S3, read from <code>is_s3</code>); a record claimed by another S1 entity no longer counts towards its former entity's maximum, so the relative rule compares each pair only against competitors that are actually available. Grouping by source rather than by entity alone reflects the ground truth: one business can legitimately appear once in Source 2 and once in Source 3, so a strong S2 candidate must not suppress a moderately confident S3 candidate. Within one source the problem statement allows several records per business; how common that is, reported by <code>profile()</code> as the mean and maximum match count, is what the OOF sweep of Section 9.5 weighs when it sets the strictness of the relative rule.</p>
+
+  <h2>9.3 <code>decide()</code>: an absolute and a relative bar</h2>
+  <pre><code>def decide(d, thr, ratio=0.0):
+    return d[(d.p &gt;= thr) &amp; (d.p &gt;= ratio * d.best)]</code></pre>
+  <p>A pair survives if its probability is at least <code>thr</code> and at least <code>ratio</code> times the best probability in its (S1, source) group. The best pair of every group satisfies the second condition trivially, so the relative bar only ever removes secondary candidates. <code>ratio = 0</code> makes it vacuous and reproduces a flat per-pair threshold; <code>ratio = 1.0</code> keeps at most one pair per (S1, source) group, barring exact ties; the values between interpolate.</p>
+  <p>A relative rule suits a per-entity metric because the cost of a candidate depends on what the entity already predicts. Take an S1 entity whose best S2 candidate has p = 0.95 and whose second has p = 0.55. A flat threshold of 0.5 keeps both; <code>ratio = 0.7</code> drops the second, since 0.55 &lt; 0.665. Such a candidate may be a genuine second record or a similarly named different business, and Section 9.4 shows that the metric rewards keeping it only when its probability is well above one half. An entity whose sole candidate has p = 0.55 keeps it under both rules, because there is no stronger competitor to be dominated by. The rule thus prunes weak secondary candidates in crowded groups while sparing lone, moderately confident ones, which one global threshold cannot express.</p>
+
+  <h2>9.4 Metric arithmetic behind the rule</h2>
+  <p>Let an S1 entity have n &gt; 0 true matches. With P predicted ids of which tp are correct, precision is tp / P, recall is tp / n, and F<sub>0.5</sub> = 1.25·P·R / (0.25·P + R), as implemented in <code>f05()</code>. Two consequences shape the decision layer.</p>
+
+  <h3>9.4.1 Singleton economics</h3>
+  <p>For a singleton the score is binary: 1.0 for an empty prediction, 0.0 for any other, so a false merge on a singleton is the largest single loss available, whereas a missed match on a non-singleton loses only a fraction of its score; the singleton share logged by <code>profile()</code> sets the price of a lenient threshold. A two-outcome model makes this explicit: if an entity's only candidate is true with probability a (in which case the entity has exactly that one match) and, when false, the entity is a singleton with probability b, predicting it has expected score a and predicting nothing has expected score (1 − a)·b. The candidate pays only when a ≥ b / (1 + b): 0.50 when a wrong candidate always means a singleton, 0.33 when it does so half the time. The sweep of Section 9.5 replaces these assumptions with the empirical OOF distribution, but the direction is fixed: more singletons, higher optimal <code>thr</code>.</p>
+
+  <h3>9.4.2 Break-even for a second candidate</h3>
+  <p>Suppose the entity already predicts one correct candidate and a second with probability q is under consideration. One correct prediction gives P = 1, R = 1/n and F<sub>0.5</sub> = 5 / (n + 4). Adding the second gives P = 1, R = 2/n and F<sub>0.5</sub> = 10 / (n + 8) if it is true, or P = 1/2, R = 1/n and F<sub>0.5</sub> = 5 / (n + 8) if it is false. The expected score with two predictions, 5·(1 + q) / (n + 8), exceeds 5 / (n + 4) if and only if</p>
+  <p>q ≥ 4 / (n + 4).</p>
+  <p>Table 9.1 evaluates this for small n. With one true match the second candidate cannot be true and always costs 0.444; with two it must be at least 0.667 likely to pay for itself; the bar reaches 0.5 only at four or more true matches. Since n is unknown at decode time, and to the extent that the mean match count logged by <code>profile()</code> shows most non-singleton entities to have few matches, a second candidate should be admitted only when nearly as confident as the first, which <code>ratio</code> values of 0.6 to 0.9 enforce against a strong <code>best</code>.</p>
+  <table class="tbl">
+    <caption>Table 9.1 — Expected F<sub>0.5</sub> when a second candidate of probability q is added to one correct prediction, by number of true matches n (exact values of the formulas in Section 9.4.2)</caption>
+    <thead><tr><th>n</th><th>F<sub>0.5</sub>, one correct</th><th>Two, second true</th><th>Two, second false</th><th>Expected with two</th><th>Break-even q</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>1.000</td><td>impossible</td><td>0.556</td><td>0.556</td><td>none: always −0.444</td></tr>
+      <tr><td>2</td><td>0.833</td><td>1.000</td><td>0.500</td><td>0.500 + 0.500·q</td><td>0.667</td></tr>
+      <tr><td>3</td><td>0.714</td><td>0.909</td><td>0.455</td><td>0.455 + 0.455·q</td><td>0.571</td></tr>
+      <tr><td>4</td><td>0.625</td><td>0.833</td><td>0.417</td><td>0.417 + 0.417·q</td><td>0.500</td></tr>
+      <tr><td>6</td><td>0.500</td><td>0.714</td><td>0.357</td><td>0.357 + 0.357·q</td><td>0.400</td></tr>
+    </tbody>
+  </table>
+  <aside class="warn"><strong>Risk.</strong> The derivation conditions on the first candidate being correct. Entities with many records in one source (n ≥ 4) are penalised by a high <code>ratio</code>, since their second and third records may score well below the first. The sweep balances this against the singleton and one-match entities, whose share <code>profile()</code> reports; if many-record entities were more frequent in the test set than in training, the selected <code>ratio</code> would be too strict for them.</aside>
+
+  <h2>9.5 Out-of-fold selection of (thr, ratio)</h2>
+  <p><code>main()</code> builds <code>dtr = decode_table(ftr, oof)</code> from the grouped-fold OOF probabilities of Chapter 8 and evaluates every combination of <code>ratio</code> in {0.0, 0.6, 0.7, 0.8, 0.9, 1.0} and <code>thr</code> in <code>np.arange(0.20, 0.96, 0.025)</code>, 31 thresholds from 0.20 to 0.95, for 186 evaluations:</p>
+  <pre><code>best_thr, best_ratio, best = 0.5, 0.0, -1.0
+for ratio in (0.0, 0.6, 0.7, 0.8, 0.9, 1.0):
+    for thr in np.arange(0.20, 0.96, 0.025):
+        s = macro_f05(to_lists(decide(dtr, thr, ratio), tr1, tr2), gt, tr1.entity_id.values)
+        if s &gt; best:
+            best_thr, best_ratio, best = float(thr), ratio, s</code></pre>
+  <p>The objective is <code>macro_f05()</code> over <em>every</em> training S1 entity: <code>load_split()</code> parses a singleton's empty <code>matched_entity_ids</code> field into an empty set, and <code>gt.get(k, set())</code> covers any S1 entity absent from the ground-truth file, so the all-or-nothing singleton term of Section 9.4.1 is part of what is maximised; tuning on matched entities only would push <code>thr</code> down and over-predict on singletons. Because <code>ratio = 0</code> is in the grid, the two-parameter rule can never score below the best flat threshold on OOF data. The comparison is strict (<code>s &gt; best</code>) and the loops run <code>ratio</code> outermost from 0.0 and <code>thr</code> ascending, so on an exact tie the lowest <code>ratio</code> and, within it, the lowest <code>thr</code> win. Each evaluation re-runs only the filter, the list conversion and the scorer.</p>
+  <figure>
+    <svg viewBox="0 0 800 330" width="100%" font-family="inherit" font-size="13" fill="#0f172a">
+      <text x="20" y="22" font-weight="bold">Illustrative OOF macro F0.5 surface over the (thr, ratio) grid (schematic shading, not measured)</text>
+      <!-- row labels -->
+      <text x="20" y="64">ratio 1.0</text>
+      <text x="20" y="100">ratio 0.9</text>
+      <text x="20" y="136">ratio 0.8</text>
+      <text x="20" y="172">ratio 0.7</text>
+      <text x="20" y="208">ratio 0.6</text>
+      <text x="20" y="244">ratio 0.0</text>
+      <!-- ratio 1.0 -->
+      <rect x="120" y="40" width="40" height="36" fill="#f1f5f9" stroke="#334155"/><rect x="160" y="40" width="40" height="36" fill="#e2e8f0" stroke="#334155"/><rect x="200" y="40" width="40" height="36" fill="#cbd5e1" stroke="#334155"/><rect x="240" y="40" width="40" height="36" fill="#dbeafe" stroke="#334155"/>
+      <rect x="280" y="40" width="40" height="36" fill="#dbeafe" stroke="#334155"/><rect x="320" y="40" width="40" height="36" fill="#dbeafe" stroke="#334155"/><rect x="360" y="40" width="40" height="36" fill="#dbeafe" stroke="#334155"/><rect x="400" y="40" width="40" height="36" fill="#dbeafe" stroke="#334155"/>
+      <rect x="440" y="40" width="40" height="36" fill="#cbd5e1" stroke="#334155"/><rect x="480" y="40" width="40" height="36" fill="#cbd5e1" stroke="#334155"/><rect x="520" y="40" width="40" height="36" fill="#e2e8f0" stroke="#334155"/><rect x="560" y="40" width="40" height="36" fill="#e2e8f0" stroke="#334155"/>
+      <rect x="600" y="40" width="40" height="36" fill="#f1f5f9" stroke="#334155"/><rect x="640" y="40" width="40" height="36" fill="#f1f5f9" stroke="#334155"/><rect x="680" y="40" width="40" height="36" fill="#f1f5f9" stroke="#334155"/><rect x="720" y="40" width="40" height="36" fill="#f1f5f9" stroke="#334155"/>
+      <!-- ratio 0.9 -->
+      <rect x="120" y="76" width="40" height="36" fill="#f1f5f9" stroke="#334155"/><rect x="160" y="76" width="40" height="36" fill="#e2e8f0" stroke="#334155"/><rect x="200" y="76" width="40" height="36" fill="#cbd5e1" stroke="#334155"/><rect x="240" y="76" width="40" height="36" fill="#dbeafe" stroke="#334155"/>
+      <rect x="280" y="76" width="40" height="36" fill="#dbeafe" stroke="#334155"/><rect x="320" y="76" width="40" height="36" fill="#bfdbfe" stroke="#334155"/><rect x="360" y="76" width="40" height="36" fill="#bfdbfe" stroke="#334155"/><rect x="400" y="76" width="40" height="36" fill="#dbeafe" stroke="#334155"/>
+      <rect x="440" y="76" width="40" height="36" fill="#dbeafe" stroke="#334155"/><rect x="480" y="76" width="40" height="36" fill="#cbd5e1" stroke="#334155"/><rect x="520" y="76" width="40" height="36" fill="#cbd5e1" stroke="#334155"/><rect x="560" y="76" width="40" height="36" fill="#e2e8f0" stroke="#334155"/>
+      <rect x="600" y="76" width="40" height="36" fill="#e2e8f0" stroke="#334155"/><rect x="640" y="76" width="40" height="36" fill="#f1f5f9" stroke="#334155"/><rect x="680" y="76" width="40" height="36" fill="#f1f5f9" stroke="#334155"/><rect x="720" y="76" width="40" height="36" fill="#f1f5f9" stroke="#334155"/>
+      <!-- ratio 0.8 -->
+      <rect x="120" y="112" width="40" height="36" fill="#f1f5f9" stroke="#334155"/><rect x="160" y="112" width="40" height="36" fill="#e2e8f0" stroke="#334155"/><rect x="200" y="112" width="40" height="36" fill="#cbd5e1" stroke="#334155"/><rect x="240" y="112" width="40" height="36" fill="#cbd5e1" stroke="#334155"/>
+      <rect x="280" y="112" width="40" height="36" fill="#dbeafe" stroke="#334155"/><rect x="320" y="112" width="40" height="36" fill="#bfdbfe" stroke="#334155"/><rect x="360" y="112" width="40" height="36" fill="#bfdbfe" stroke="#334155"/><rect x="400" y="112" width="40" height="36" fill="#bfdbfe" stroke="#334155"/>
+      <rect x="440" y="112" width="40" height="36" fill="#dbeafe" stroke="#334155"/><rect x="480" y="112" width="40" height="36" fill="#dbeafe" stroke="#334155"/><rect x="520" y="112" width="40" height="36" fill="#cbd5e1" stroke="#334155"/><rect x="560" y="112" width="40" height="36" fill="#cbd5e1" stroke="#334155"/>
+      <rect x="600" y="112" width="40" height="36" fill="#e2e8f0" stroke="#334155"/><rect x="640" y="112" width="40" height="36" fill="#e2e8f0" stroke="#334155"/><rect x="680" y="112" width="40" height="36" fill="#f1f5f9" stroke="#334155"/><rect x="720" y="112" width="40" height="36" fill="#f1f5f9" stroke="#334155"/>
+      <!-- ratio 0.7 -->
+      <rect x="120" y="148" width="40" height="36" fill="#f1f5f9" stroke="#334155"/><rect x="160" y="148" width="40" height="36" fill="#e2e8f0" stroke="#334155"/><rect x="200" y="148" width="40" height="36" fill="#e2e8f0" stroke="#334155"/><rect x="240" y="148" width="40" height="36" fill="#cbd5e1" stroke="#334155"/>
+      <rect x="280" y="148" width="40" height="36" fill="#dbeafe" stroke="#334155"/><rect x="320" y="148" width="40" height="36" fill="#dbeafe" stroke="#334155"/><rect x="360" y="148" width="40" height="36" fill="#bfdbfe" stroke="#334155"/><rect x="400" y="148" width="40" height="36" fill="#bfdbfe" stroke="#334155"/>
+      <rect x="440" y="148" width="40" height="36" fill="#bfdbfe" stroke="#334155"/><rect x="480" y="148" width="40" height="36" fill="#dbeafe" stroke="#334155"/><rect x="520" y="148" width="40" height="36" fill="#dbeafe" stroke="#334155"/><rect x="560" y="148" width="40" height="36" fill="#cbd5e1" stroke="#334155"/>
+      <rect x="600" y="148" width="40" height="36" fill="#cbd5e1" stroke="#334155"/><rect x="640" y="148" width="40" height="36" fill="#e2e8f0" stroke="#334155"/><rect x="680" y="148" width="40" height="36" fill="#e2e8f0" stroke="#334155"/><rect x="720" y="148" width="40" height="36" fill="#f1f5f9" stroke="#334155"/>
+      <!-- ratio 0.6 -->
+      <rect x="120" y="184" width="40" height="36" fill="#f1f5f9" stroke="#334155"/><rect x="160" y="184" width="40" height="36" fill="#e2e8f0" stroke="#334155"/><rect x="200" y="184" width="40" height="36" fill="#e2e8f0" stroke="#334155"/><rect x="240" y="184" width="40" height="36" fill="#cbd5e1" stroke="#334155"/>
+      <rect x="280" y="184" width="40" height="36" fill="#cbd5e1" stroke="#334155"/><rect x="320" y="184" width="40" height="36" fill="#dbeafe" stroke="#334155"/><rect x="360" y="184" width="40" height="36" fill="#dbeafe" stroke="#334155"/><rect x="400" y="184" width="40" height="36" fill="#bfdbfe" stroke="#334155"/>
+      <rect x="440" y="184" width="40" height="36" fill="#bfdbfe" stroke="#334155"/><rect x="480" y="184" width="40" height="36" fill="#bfdbfe" stroke="#334155"/><rect x="520" y="184" width="40" height="36" fill="#dbeafe" stroke="#334155"/><rect x="560" y="184" width="40" height="36" fill="#dbeafe" stroke="#334155"/>
+      <rect x="600" y="184" width="40" height="36" fill="#cbd5e1" stroke="#334155"/><rect x="640" y="184" width="40" height="36" fill="#e2e8f0" stroke="#334155"/><rect x="680" y="184" width="40" height="36" fill="#e2e8f0" stroke="#334155"/><rect x="720" y="184" width="40" height="36" fill="#f1f5f9" stroke="#334155"/>
+      <!-- ratio 0.0 -->
+      <rect x="120" y="220" width="40" height="36" fill="#f1f5f9" stroke="#334155"/><rect x="160" y="220" width="40" height="36" fill="#f1f5f9" stroke="#334155"/><rect x="200" y="220" width="40" height="36" fill="#e2e8f0" stroke="#334155"/><rect x="240" y="220" width="40" height="36" fill="#e2e8f0" stroke="#334155"/>
+      <rect x="280" y="220" width="40" height="36" fill="#cbd5e1" stroke="#334155"/><rect x="320" y="220" width="40" height="36" fill="#cbd5e1" stroke="#334155"/><rect x="360" y="220" width="40" height="36" fill="#dbeafe" stroke="#334155"/><rect x="400" y="220" width="40" height="36" fill="#dbeafe" stroke="#334155"/>
+      <rect x="440" y="220" width="40" height="36" fill="#bfdbfe" stroke="#334155"/><rect x="480" y="220" width="40" height="36" fill="#bfdbfe" stroke="#334155"/><rect x="520" y="220" width="40" height="36" fill="#dbeafe" stroke="#334155"/><rect x="560" y="220" width="40" height="36" fill="#dbeafe" stroke="#334155"/>
+      <rect x="600" y="220" width="40" height="36" fill="#cbd5e1" stroke="#334155"/><rect x="640" y="220" width="40" height="36" fill="#cbd5e1" stroke="#334155"/><rect x="680" y="220" width="40" height="36" fill="#e2e8f0" stroke="#334155"/><rect x="720" y="220" width="40" height="36" fill="#f1f5f9" stroke="#334155"/>
+      <!-- x axis labels (every 0.10) -->
+      <text x="128" y="276">0.20</text>
+      <text x="208" y="276">0.30</text>
+      <text x="288" y="276">0.40</text>
+      <text x="368" y="276">0.50</text>
+      <text x="448" y="276">0.60</text>
+      <text x="528" y="276">0.70</text>
+      <text x="608" y="276">0.80</text>
+      <text x="688" y="276">0.90</text>
+      <text x="120" y="296">thr (grid step 0.025; columns shown at 0.05 for legibility)</text>
+      <!-- legend -->
+      <rect x="120" y="308" width="18" height="14" fill="#f1f5f9" stroke="#334155"/><text x="142" y="320">low</text>
+      <rect x="185" y="308" width="18" height="14" fill="#cbd5e1" stroke="#334155"/><text x="207" y="320">mid</text>
+      <rect x="250" y="308" width="18" height="14" fill="#bfdbfe" stroke="#334155"/><text x="272" y="320">high macro F0.5</text>
+      <text x="420" y="320">selected (thr*, ratio*): to be filled from the run log</text>
+    </svg>
+    <figcaption>Figure 9.2 — Schematic of the (thr, ratio) grid searched by <code>main()</code>: six <code>ratio</code> rows and 31 <code>thr</code> columns (0.20 to 0.95, step 0.025). Shading is illustrative only: low thresholds lose singletons to false merges, high thresholds lose recall, and a larger <code>ratio</code> shifts the ridge left. The actual surface and argmax come from the run log.</figcaption>
+  </figure>
+  <table class="tbl">
+    <caption>Table 9.2 — Selected operating point and decode statistics, to be filled from the run log</caption>
+    <thead><tr><th>Quantity</th><th>Source in log</th><th>Value</th></tr></thead>
+    <tbody>
+      <tr><td>Selected <code>thr</code></td><td><code>OOF macro F0.5 = … at thr=…</code></td><td>to be filled from the run log</td></tr>
+      <tr><td>Selected <code>ratio</code></td><td>same line, <code>ratio=…</code></td><td>to be filled from the run log</td></tr>
+      <tr><td>OOF macro F<sub>0.5</sub> at the optimum (singletons included)</td><td>same line</td><td>to be filled from the run log</td></tr>
+      <tr><td>Macro F<sub>0.5</sub> with all candidates predicted (floor)</td><td><code>macro F0.5 if every candidate were predicted</code></td><td>to be filled from the run log</td></tr>
+      <tr><td>Blocking-oracle macro F<sub>0.5</sub> (ceiling)</td><td><code>blocking oracle macro F0.5</code></td><td>to be filled from the run log</td></tr>
+      <tr><td>Test S1 entities with ≥ 1 match, overall and by country</td><td><code>test: …/… S1 entities matched; by country</code></td><td>to be filled from the run log</td></tr>
+    </tbody>
+  </table>
+
+  <h2>9.6 <code>to_lists()</code>, ordering and the writer</h2>
+  <pre><code>def to_lists(d, s1, other, col="i2"):
+    out = {e: [] for e in s1.entity_id}
+    ids1, ids2 = s1.entity_id.values, other.entity_id.values
+    for a, b in zip(d.i1.values, d[col].values):
+        out[ids1[a]].append(ids2[b])
+    return out</code></pre>
+  <p><code>to_lists()</code> converts a table of row indices into a dictionary from S1 <code>entity_id</code> to a list of S2/S3 ids. It is pre-populated with an empty list for every S1 entity, so an entity with no surviving pair is present as a singleton rather than missing, as the one-row-per-entity rule requires. The decoded table is still in descending <code>p</code> order after <code>decide()</code>, so each match list runs from the most to the least confident id. For the candidate file, <code>main()</code> passes the unfiltered <code>fte[["i1", "i2"]]</code>, so those lists follow blocking order and matches are a subset of candidates by construction.</p>
+  <p>The writer in <code>main()</code> iterates over <code>te1.entity_id.values</code> in source-file order and emits a header and one tab-separated line per entity; <code>col</code> is <code>matched_entity_ids</code> for <code>matching_results.tsv</code> and <code>candidate_entity_ids</code> for <code>candidate_pairs.tsv</code>, the column names required by the problem statement:</p>
+  <pre><code>fh.write(f"source1_entity_id\t{col}\n")
+for e in te1.entity_id.values:
+    fh.write(f"{e}\t{','.join(dict.fromkeys(lists[e]))}\n")</code></pre>
+  <p><code>dict.fromkeys()</code> removes duplicate ids while preserving order, which a <code>set</code> would not. Duplicates cannot in fact arise, since <code>drop_duplicates("i2")</code> leaves each S2/S3 id at most once in the whole matching file and <code>block()</code> de-duplicates (<code>i1</code>, <code>i2</code>) pairs before features are computed; the call guards the rejection rule "no duplicate entity IDs within a single ID list" (see Chapter 2) against upstream changes. An empty list renders as the id, a tab and nothing else, the required singleton format; <code>newline=""</code> keeps line endings at exactly <code>\n</code>. Chapter 11 covers packaging.</p>
+
+  <aside class="note"><strong>Design note.</strong> A single global (<code>thr</code>, <code>ratio</code>) is selected on US and Indian OOF data and applied unchanged to France, whose probability distribution the model has never seen. Two extensions follow. Per-source parameters would let S2 and S3 differ in strictness, today reflected only in the <code>is_s3</code> matcher feature and the per-source grouping of <code>decode_table()</code>: the grid becomes (<code>thr</code><sub>S2</sub>, <code>thr</code><sub>S3</sub>, <code>ratio</code>) inside the same OOF loop. Per-country parameters would be selected for US and India separately and, for an unseen country, replaced by the more conservative of the two, since a false merge costs more than a missed link. Both add conditions to <code>decide()</code> only; the per-country match rate logged by <code>main()</code> is the check for France (see Chapter 14).</aside>
+</section>

@@ -1,0 +1,247 @@
+<section class="chapter" id="ch-15">
+  <h1><span class="num">15</span> Appendices</h1>
+  <p class="lead">This chapter is the reference layer of the document. It collects, in tabular form, every knob that governs the behaviour of <code>er_pipeline.py</code> (command-line flags, function parameters, lookup tables, model parameters and search grids), every line that <code>main()</code> writes to the run log together with the range in which each value indicates a healthy run, the exact byte-level format of the seven input files and the two output files, a glossary of the vocabulary used throughout the document, and a one-line index of every function in the script. Nothing here introduces new behaviour; each entry is traceable to a name in the source, and the narrative chapters (see Chapters 5 to 11) explain why the values are what they are.</p>
+
+  <h2>15.1 Appendix A: CLI and configuration reference</h2>
+  <p>The pipeline exposes three command-line flags and no configuration file; every other setting is a Python default or a module-level constant. This is deliberate: a single script whose behaviour is fixed by its source is easier to audit under the reproducibility review described in Chapter 13 than one whose behaviour depends on an external configuration. Table 15.1 lists each setting with its owner, its default and the effect of changing it. Values marked <em>const</em> are module-level constants (regular expressions and lookup tables) that cannot be changed without editing the file.</p>
+  <p>Two conventions in the argument parser matter for operation. First, <code>parse_known_args()</code> is used instead of <code>parse_args()</code>, so the <code>-f kernel.json</code> argument that Jupyter injects when the script is run inside a notebook cell is ignored rather than rejected. Second, <code>--data-dir</code> is optional: when it is absent, <code>find_data_dir()</code> searches <code>/kaggle/input</code>, the working directory, its parent and <code>dataset/</code> recursively for <code>train_source1.tsv</code> and returns the grandparent of the first hit, which is the directory that contains both <code>train/</code> and <code>test/</code>.</p>
+  <table class="tbl">
+    <caption>Table 15.1 — Configuration reference: every flag, parameter, constant and grid in <code>er_pipeline.py</code></caption>
+    <thead><tr><th>Setting</th><th>Owner</th><th>Default / value</th><th>Effect and notes</th></tr></thead>
+    <tbody>
+      <tr><td><code>--data-dir</code></td><td><code>main()</code> argparse</td><td>none (auto-detect)</td><td>Directory containing <code>train/</code> and <code>test/</code>. Absent: <code>find_data_dir()</code> searches <code>/kaggle/input</code>, <code>.</code>, <code>..</code>, <code>dataset</code>; raises <code>FileNotFoundError</code> when no <code>train_source1.tsv</code> is found.</td></tr>
+      <tr><td><code>--out-dir</code></td><td><code>main()</code> argparse</td><td><code>output</code></td><td>Destination of <code>matching_results.tsv</code> and <code>candidate_pairs.tsv</code>; created with <code>os.makedirs(exist_ok=True)</code>.</td></tr>
+      <tr><td><code>--folds</code></td><td><code>main()</code> argparse</td><td><code>5</code> (int)</td><td>Number of <code>GroupKFold</code> splits grouped by S1 row index <code>i1</code>. Fewer folds: faster, noisier OOF estimate; more folds: closer to the full-data model.</td></tr>
+      <tr><td><code>read_tsv()</code> options</td><td><code>read_tsv()</code></td><td><code>sep="\t"</code>, <code>dtype=str</code>, <code>keep_default_na=False</code>, <code>quoting=3</code></td><td>Tab separation, no NA parsing (empty cells stay <code>""</code>), <code>QUOTE_NONE</code> so quotation marks inside names and addresses are data, not delimiters.</td></tr>
+      <tr><td><code>NAME_ABBR</code></td><td>const</td><td>18 entries</td><td>Name abbreviation expansion applied by <code>norm_name()</code> token by token (<code>corp</code>, <code>co</code>, <code>inc</code>, <code>ltd</code>, <code>pvt</code>, <code>pvtltd</code>, <code>intl</code>, <code>mfg</code>, <code>svc</code>, <code>svcs</code>, <code>bros</code>, <code>assoc</code>, <code>natl</code>, <code>tech</code>, <code>grp</code>, <code>ent</code>, <code>cie</code>, <code>ste</code>).</td></tr>
+      <tr><td><code>LEGAL</code></td><td>const</td><td>26 tokens</td><td>Tokens removed by <code>core_name()</code>: 16 English/Indian legal and function words plus 10 French forms (<code>sarl</code>, <code>sas</code>, <code>sasu</code>, <code>sa</code>, <code>eurl</code>, <code>sci</code>, <code>snc</code>, <code>societe</code>, <code>compagnie</code>, <code>et</code>). Falls back to the full name when nothing remains.</td></tr>
+      <tr><td><code>ADDR_ABBR</code></td><td>const</td><td>41 entries</td><td>Address abbreviation expansion applied by <code>norm_addr()</code>; covers US street types, compass points, Indian idioms (<code>nr</code>, <code>opp</code>, <code>mg</code>, <code>ngr</code>, <code>clny</code>, <code>sec</code>, <code>marg</code>, <code>salai</code>) and French idioms (<code>bd</code>, <code>fbg</code>, <code>chem</code>, <code>imp</code>).</td></tr>
+      <tr><td><code>ADDR_STOP</code></td><td>const</td><td>16 tokens</td><td>Tokens dropped from <code>addr_n</code> to form <code>addr_c</code>: landmark connectors (<code>near</code>, <code>opposite</code>, <code>behind</code>, <code>beside</code>, <code>next</code>, <code>to</code>), function words and French articles (<code>de</code>, <code>la</code>, <code>le</code>, <code>du</code>, <code>des</code>).</td></tr>
+      <tr><td><code>_postal</code></td><td>const regex</td><td><code>\b(\d{5,6})(?:-\d{4})?\b</code></td><td>Postal code = last match on the raw address; 5 digits (US ZIP, French code postal) or 6 digits (Indian PIN); optional ZIP+4 suffix is consumed but not captured.</td></tr>
+      <tr><td><code>_dotted</code></td><td>const regex</td><td><code>(?&lt;![a-z])(?:[a-z]\.){2,}[a-z]?(?![a-z])</code></td><td>Dotted acronyms (<code>p.v.t.</code>, <code>u.s.a</code>) collapsed before punctuation removal.</td></tr>
+      <tr><td><code>_ALIAS</code></td><td>const regex</td><td><code>d/b/a</code>, <code>d.b.a.</code>, <code>dba</code>, <code>doing business as</code>, <code>trading as</code>, <code>t/a</code>, <code>a/k/a</code>, <code>a.k.a.</code>, <code>also known as</code>, <code>formerly (known as)</code>; case-insensitive, spaces around the slashes tolerated</td><td>Applied to the raw name in <code>prep()</code> and <code>name_parts()</code>, before <code>basic()</code> destroys the slashes and dots the markers depend on. A bare <code>aka</code> is deliberately excluded because it can be a legitimate name token.</td></tr>
+      <tr><td><code>_punct</code>, <code>_space</code>, <code>_digits</code></td><td>const regex</td><td><code>[^a-z0-9 ]+</code>, <code>\s+</code>, <code>\d+</code></td><td>Punctuation-to-space, whitespace collapse, digit-run extraction for <code>nums</code> and <code>house</code>.</td></tr>
+      <tr><td><code>k_name</code></td><td><code>block()</code></td><td><code>25</code></td><td>Top-k neighbours per S1 row in the core-name view. Must exceed the maximum number of true matches per S1 entity (logged by <code>profile()</code>).</td></tr>
+      <tr><td><code>k_full</code></td><td><code>block()</code></td><td><code>25</code></td><td>Top-k in the <code>name_c + " | " + addr_c</code> view.</td></tr>
+      <tr><td><code>k_addr</code></td><td><code>block()</code></td><td><code>10</code></td><td>Top-k in the address-only view; smaller because addresses are shared by unrelated businesses.</td></tr>
+      <tr><td><code>k_postal</code></td><td><code>block()</code></td><td><code>10</code></td><td>Top-k by name cosine among the S2/S3 records of the same country block that share the S1 row's <code>postal</code> value; rows with an empty postal code skip this view.</td></tr>
+      <tr><td>cosine floor</td><td><code>block()</code></td><td><code>sc &gt; 0.05</code></td><td>Neighbours at or below 0.05 cosine are discarded in all four views.</td></tr>
+      <tr><td><code>TfidfVectorizer</code></td><td><code>block()</code></td><td><code>analyzer="char_wb"</code>, <code>ngram_range=(2, 4)</code>, <code>min_df=2</code>, <code>sublinear_tf=True</code>, <code>dtype=float32</code></td><td>One vectoriser per view, fitted on the union of the S1 and S2/S3 texts of the split being processed.</td></tr>
+      <tr><td><code>max_cells</code></td><td><code>topk_sparse()</code></td><td><code>2e7</code></td><td>Budget for the dense chunk × |B| score block; chunk rows = <code>max(16, int(max_cells // n_b))</code>.</td></tr>
+      <tr><td><code>k</code> clamp</td><td><code>topk_sparse()</code></td><td><code>min(k, n_b)</code></td><td>Prevents <code>argpartition</code> from requesting more columns than exist in a small country block.</td></tr>
+      <tr><td><code>chunk</code></td><td><code>pair_cos()</code></td><td><code>200_000</code></td><td>Pairs per slice when recomputing <code>cos_name</code>, <code>cos_full</code>, <code>cos_addr</code>; bounds peak memory.</td></tr>
+      <tr><td><code>params</code></td><td><code>main()</code></td><td><code>objective="binary"</code>, <code>learning_rate=0.05</code>, <code>num_leaves=63</code>, <code>min_child_samples=40</code>, <code>feature_fraction=0.8</code>, <code>bagging_fraction=0.8</code>, <code>bagging_freq=1</code>, <code>lambda_l2=1.0</code>, <code>verbose=-1</code>, <code>n_jobs=-1</code></td><td>LightGBM parameters shared by the fold models and the final refit. No <code>seed</code> is set, so bagging is nondeterministic at the last decimals.</td></tr>
+      <tr><td>max rounds / patience</td><td><code>main()</code></td><td><code>2000</code> / <code>early_stopping(100)</code></td><td>Per fold: up to 2,000 boosting rounds, stop after 100 rounds without validation-loss improvement.</td></tr>
+      <tr><td>refit rounds</td><td><code>main()</code></td><td><code>int(mean(best_iteration) * 1.1)</code></td><td>Final model on all training pairs; 10% more rounds than the fold average compensates for the larger training set.</td></tr>
+      <tr><td><code>ratio</code> grid</td><td><code>main()</code></td><td><code>(0.0, 0.6, 0.7, 0.8, 0.9, 1.0)</code></td><td>Relative-ratio candidates for <code>decide()</code>; <code>0.0</code> reproduces a flat threshold.</td></tr>
+      <tr><td><code>thr</code> grid</td><td><code>main()</code></td><td><code>np.arange(0.20, 0.96, 0.025)</code> = 31 values, 0.200 to 0.950</td><td>Absolute probability threshold; 6 × 31 = 186 decodes of the OOF table are scored with <code>macro_f05()</code>.</td></tr>
+      <tr><td>sweep initial state</td><td><code>main()</code></td><td><code>best_thr=0.5</code>, <code>best_ratio=0.0</code>, <code>best=-1.0</code></td><td>Any scored grid point replaces the initial state; the fallback 0.5 is never used in practice.</td></tr>
+      <tr><td><code>decide(ratio)</code></td><td><code>decide()</code></td><td><code>0.0</code></td><td>Function default; <code>main()</code> always passes the swept value.</td></tr>
+      <tr><td><code>to_lists(col)</code></td><td><code>to_lists()</code></td><td><code>"i2"</code></td><td>Column of the decoded table holding the S2/S3 row index.</td></tr>
+      <tr><td>importance display</td><td><code>main()</code></td><td><code>feature_importance("gain")</code>, <code>head(15)</code></td><td>Printed after the refit; not written to a file.</td></tr>
+      <tr><td>profile sample</td><td><code>profile()</code></td><td><code>head(3)</code></td><td>Three raw rows of S1 and of S2+S3 are printed for a visual sanity check of the parse.</td></tr>
+      <tr><td><code>log()</code> format</td><td><code>log()</code></td><td><code>[{elapsed:7.1f}s] {msg}</code></td><td>Elapsed seconds since module import <code>T0</code>, right-aligned in 7 characters, one decimal.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>15.2 Appendix B: Log-line reference</h2>
+  <p>Every diagnostic the pipeline produces goes through <code>log()</code>, which prefixes the message with the elapsed wall-clock time, so the run log doubles as a coarse profiler (see Chapter 12). Figure 15.1 places each log line on the <code>main()</code> timeline; Table 15.2 lists the lines in the order they appear, with the quantity each one reports and the range in which the value indicates a healthy run. The healthy ranges are design expectations derived from the metric and the algorithm, not measured results: the pipeline has not yet been run on the released data, and the measured values are to be filled from the run log in the results table of Chapter 10.</p>
+  <figure>
+    <svg viewBox="0 0 800 300" width="100%" font-family="inherit" font-size="13" fill="#0f172a">
+      <defs>
+        <marker id="ch15-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="#334155"/>
+        </marker>
+      </defs>
+      <!-- row 1 -->
+      <rect x="10" y="20" width="120" height="56" rx="6" fill="#e2e8f0" stroke="#334155"/>
+      <text x="70" y="42" text-anchor="middle">load_split</text>
+      <text x="70" y="62" text-anchor="middle" font-size="13">data dir</text>
+      <rect x="165" y="20" width="120" height="56" rx="6" fill="#e2e8f0" stroke="#334155"/>
+      <text x="225" y="42" text-anchor="middle">profile ×2</text>
+      <text x="225" y="62" text-anchor="middle">== train / == test</text>
+      <rect x="320" y="20" width="120" height="56" rx="6" fill="#dbeafe" stroke="#334155"/>
+      <text x="380" y="42" text-anchor="middle">block (train)</text>
+      <text x="380" y="62" text-anchor="middle">blocking: N pairs</text>
+      <rect x="475" y="20" width="120" height="56" rx="6" fill="#dbeafe" stroke="#334155"/>
+      <text x="535" y="42" text-anchor="middle">label + recall</text>
+      <text x="535" y="62" text-anchor="middle">4 recall lines</text>
+      <rect x="630" y="20" width="160" height="56" rx="6" fill="#dcfce7" stroke="#334155"/>
+      <text x="710" y="42" text-anchor="middle">GroupKFold loop</text>
+      <text x="710" y="62" text-anchor="middle">fold k: best_iter</text>
+      <line x1="130" y1="48" x2="165" y2="48" stroke="#334155" stroke-width="1.5" marker-end="url(#ch15-arrow)"/>
+      <line x1="285" y1="48" x2="320" y2="48" stroke="#334155" stroke-width="1.5" marker-end="url(#ch15-arrow)"/>
+      <line x1="440" y1="48" x2="475" y2="48" stroke="#334155" stroke-width="1.5" marker-end="url(#ch15-arrow)"/>
+      <line x1="595" y1="48" x2="630" y2="48" stroke="#334155" stroke-width="1.5" marker-end="url(#ch15-arrow)"/>
+      <!-- connector down -->
+      <path d="M 710 76 L 710 110 L 90 110 L 90 140" fill="none" stroke="#334155" stroke-width="1.5" marker-end="url(#ch15-arrow)"/>
+      <!-- row 2 -->
+      <rect x="10" y="140" width="160" height="56" rx="6" fill="#fef3c7" stroke="#334155"/>
+      <text x="90" y="162" text-anchor="middle">(thr, ratio) sweep</text>
+      <text x="90" y="182" text-anchor="middle">OOF macro F0.5</text>
+      <rect x="205" y="140" width="150" height="56" rx="6" fill="#fef3c7" stroke="#334155"/>
+      <text x="280" y="162" text-anchor="middle">floor / oracle</text>
+      <text x="280" y="182" text-anchor="middle">2 bound lines</text>
+      <rect x="390" y="140" width="120" height="56" rx="6" fill="#dcfce7" stroke="#334155"/>
+      <text x="450" y="162" text-anchor="middle">refit + gain</text>
+      <text x="450" y="182" text-anchor="middle">print top 15</text>
+      <rect x="545" y="140" width="120" height="56" rx="6" fill="#dbeafe" stroke="#334155"/>
+      <text x="605" y="162" text-anchor="middle">block (test)</text>
+      <text x="605" y="182" text-anchor="middle">blocking: N pairs</text>
+      <rect x="690" y="140" width="100" height="56" rx="6" fill="#f1f5f9" stroke="#334155"/>
+      <text x="740" y="162" text-anchor="middle">predict</text>
+      <text x="740" y="182" text-anchor="middle">decode</text>
+      <line x1="170" y1="168" x2="205" y2="168" stroke="#334155" stroke-width="1.5" marker-end="url(#ch15-arrow)"/>
+      <line x1="355" y1="168" x2="390" y2="168" stroke="#334155" stroke-width="1.5" marker-end="url(#ch15-arrow)"/>
+      <line x1="510" y1="168" x2="545" y2="168" stroke="#334155" stroke-width="1.5" marker-end="url(#ch15-arrow)"/>
+      <line x1="665" y1="168" x2="690" y2="168" stroke="#334155" stroke-width="1.5" marker-end="url(#ch15-arrow)"/>
+      <!-- connector down -->
+      <path d="M 740 196 L 740 225 L 400 225 L 400 240" fill="none" stroke="#334155" stroke-width="1.5" marker-end="url(#ch15-arrow)"/>
+      <!-- row 3 -->
+      <rect x="230" y="240" width="340" height="50" rx="6" fill="#e2e8f0" stroke="#334155"/>
+      <text x="400" y="260" text-anchor="middle">write TSVs: wrote path ×2</text>
+      <text x="400" y="280" text-anchor="middle">test: n/N S1 entities matched; by country</text>
+    </svg>
+    <figcaption>Figure 15.1 — Position of every <code>log()</code> call on the <code>main()</code> timeline; box colour marks the stage (grey: I/O, blue: blocking, green: model, yellow: decision tuning).</figcaption>
+  </figure>
+  <table class="tbl">
+    <caption>Table 15.2 — Log-line reference in order of appearance, with meaning and healthy range</caption>
+    <thead><tr><th>#</th><th>Log line (format)</th><th>Emitted by</th><th>Meaning</th><th>Healthy range / what a deviation means</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td><code>data dir: {path}</code></td><td><code>main()</code></td><td>Resolved data directory.</td><td>Path must contain <code>train/</code> and <code>test/</code>. A path under <code>/kaggle/input</code> when running locally means a stale copy was picked up.</td></tr>
+      <tr><td>2</td><td><code>== train: S1={n:,}  S2+S3={m:,}</code></td><td><code>profile()</code></td><td>Record counts per split.</td><td>Must equal the line counts of the TSVs minus headers; a shortfall means a tab or quote parse fault.</td></tr>
+      <tr><td>3</td><td><code>   S1 countries: {dict}</code></td><td><code>profile()</code></td><td>Raw <code>country</code> value counts in S1.</td><td>Train: US and India only. Test: additionally France. An S1 label absent from S2/S3 after <code>basic()</code> folding (including a blank) falls back to all S2/S3 records in <code>block()</code>; a spelling variant present on both sides forms its own partition and should be noted.</td></tr>
+      <tr><td>4</td><td><code>   S2/S3 countries: {dict}</code></td><td><code>profile()</code></td><td>Raw country counts in S2+S3.</td><td>Same keys as line 3; a key present in S1 but absent here triggers the all-records fallback for that group.</td></tr>
+      <tr><td>5</td><td><code>   singletons: {f:.3f}  mean matches: {x:.2f}  max: {n}</code></td><td><code>profile()</code> (train only)</td><td>Fraction of S1 entities with an empty ground-truth list; mean and maximum list length.</td><td><code>max</code> should not exceed <code>k_name</code> (25): above it, no single view can hold every true match of the largest entity and only the union of the four views can reach them. The singleton fraction sets the floor a trivial empty submission would score (see Chapter 2).</td></tr>
+      <tr><td>6</td><td>(raw <code>head(3)</code> of S1 and S2+S3)</td><td><code>profile()</code> via <code>print</code></td><td>Visual parse check.</td><td>Four named columns with plausible content; a single wide column means the file was read without a tab separator.</td></tr>
+      <tr><td>7</td><td>lines 2 to 4 and 6 repeated for <code>== test</code></td><td><code>profile()</code></td><td>Test split profile; no singleton line because <code>gt is None</code>.</td><td>As above.</td></tr>
+      <tr><td>8</td><td><code>blocking: {n:,} pairs ({x:.1f} per S1)</code></td><td><code>block()</code> (train)</td><td>Size of the de-duplicated candidate table and its mean per S1 entity.</td><td>Upper bound per S1 is <code>k_name + k_full + k_addr + k_postal</code> = 70 before de-duplication; typical values are well below because the views agree. Near 0 means the country partition or the 0.05 floor removed everything; near 70 means the views disagree entirely.</td></tr>
+      <tr><td>9</td><td><code>blocking recall ceiling: {r:.4f}  (pos={p:,} / true={t:,})</code></td><td><code>main()</code></td><td>Fraction of ground-truth pairs present in the candidate table.</td><td>As close to 1.0 as possible; every missed pair is unrecoverable downstream. A value below about 0.9 makes blocking, not the matcher, the bottleneck.</td></tr>
+      <tr><td>10</td><td><code>S1 entities with &gt;=1 true match blocked: {a:,}/{b:,}</code></td><td><code>main()</code></td><td>Entity-level recall of blocking (the metric is macro over entities).</td><td>Ratio should track line 9; if it is markedly lower, misses concentrate on entities with a single true match, which cost a full point each.</td></tr>
+      <tr><td>11</td><td><code>blocking recall by country: {dict}</code></td><td><code>main()</code></td><td>Line 9 broken down by normalised S1 country.</td><td>The two seen countries should be close; a gap of several points indicates a country-specific normalisation deficit (see Chapter 5).</td></tr>
+      <tr><td>12</td><td><code>blocking recall by source: {dict}</code></td><td><code>main()</code></td><td>Line 9 broken down by S2 / S3.</td><td>Similar values; the weaker source reveals which field quality the views fail on.</td></tr>
+      <tr><td>13</td><td><code>fold {k}: best_iter={n}</code> (× <code>--folds</code>)</td><td><code>main()</code></td><td>Early-stopped round count per fold.</td><td>Well below 2,000 and similar across folds. 2,000 means no convergence (raise the cap); a very small value suggests a trivially separable or leaking feature.</td></tr>
+      <tr><td>14</td><td><code>OOF macro F0.5 = {s:.4f} at thr={t:.3f} ratio={r}</code></td><td><code>main()</code></td><td>The validation score and the selected operating point.</td><td>This is the number reported as the expected leaderboard score for seen countries. <code>thr</code> should be interior to [0.20, 0.95]; a boundary value means the grid should be widened. <code>thr</code> above 0.5 is expected because singletons and F<sub>0.5</sub> both reward precision.</td></tr>
+      <tr><td>15</td><td><code>macro F0.5 if every candidate were predicted (no model; floor): {s:.4f}</code></td><td><code>main()</code></td><td>Score of predicting all candidates.</td><td>Always at or below line 14; the gap is the value the matcher adds over blocking alone.</td></tr>
+      <tr><td>16</td><td><code>blocking oracle macro F0.5 (predict exactly the true candidate pairs; ceiling): {s:.4f}</code></td><td><code>main()</code></td><td>Score of a perfect matcher on the blocked pairs.</td><td>Always at or above line 14. Gap to line 14 = matcher headroom; gap to 1.0 = blocking headroom.</td></tr>
+      <tr><td>17</td><td>(gain importances, 15 rows)</td><td><code>main()</code> via <code>print</code></td><td>Top features of the refit model.</td><td>Context features (<code>*_gap1</code>, <code>rank1</code>) and <code>cos_full</code> are expected near the top; a length or count feature dominating suggests a distribution artefact.</td></tr>
+      <tr><td>18</td><td><code>blocking: {n:,} pairs ({x:.1f} per S1)</code></td><td><code>block()</code> (test)</td><td>Test candidate table size.</td><td>Pairs per S1 comparable to line 8; the test value is what <code>candidate_pairs.tsv</code> contains.</td></tr>
+      <tr><td>19</td><td><code>wrote {path}</code> (× 2)</td><td><code>main()</code></td><td>Output file paths.</td><td>Two lines, <code>matching_results.tsv</code> then <code>candidate_pairs.tsv</code>.</td></tr>
+      <tr><td>20</td><td><code>test: {n:,}/{N:,} S1 entities matched; by country: {dict}</code></td><td><code>main()</code></td><td>Fraction of test S1 entities with a non-empty match list, overall and per raw country.</td><td>Seen countries should approximate 1 minus the train singleton fraction (line 5). France should be in the same range: far lower means the unseen country is starved by the threshold, far higher means it is over-matched (see Chapter 14).</td></tr>
+    </tbody>
+  </table>
+  <aside class="warn"><strong>Risk.</strong> Lines 14 to 16 are computed on training entities of the seen countries only. A healthy OOF score does not certify French performance; line 20 is the only France-specific signal the log provides.</aside>
+
+  <h2>15.3 Appendix C: File format reference</h2>
+  <p>All nine files are tab-separated text with a single header row and no quoting. The pipeline reads the seven dataset files with <code>read_tsv()</code>; the problem statement's rule that tabs are the only delimiter matters because both addresses and identifier lists contain commas. The examples below use illustrative identifiers and values in the format the problem statement specifies; they are not rows of the released data. Tab characters are shown as literal tabs inside the code blocks.</p>
+  <dl>
+    <dt><code>train/train_source1.tsv</code>, <code>train/train_source2.tsv</code>, <code>train/train_source3.tsv</code>, <code>test/test_source1.tsv</code>, <code>test/test_source2.tsv</code>, <code>test/test_source3.tsv</code></dt>
+    <dd>Four columns: <code>entity_id</code> (prefix <code>S1-</code>, <code>S2-</code> or <code>S3-</code> identifies the source), <code>business_name</code>, <code>business_address</code>, <code>country</code>. Any field other than <code>entity_id</code> may be empty. The problem statement designates Source 1 as the deduplicated reference source and gives no such guarantee for Sources 2 and 3; there is no separate source column, the prefix and the file are the only source indicators.</dd>
+  </dl>
+<pre><code>entity_id	business_name	business_address	country
+S1-00001	Acme Holdings LLC dba Acme Pizza	12 Main St, Suite 4, Springfield, 62704	US
+S2-00047	ACME PIZZA	12 Main Street Ste 4 Springfield IL 62704-1234	US
+S3-00812	Sharma Bros. Pvt. Ltd.	Nr SBI ATM, MG Rd, Sector 5, Noida 201301	India</code></pre>
+  <dl>
+    <dt><code>train/train_ground_truth.tsv</code></dt>
+    <dd>Two columns: <code>source1_entity_id</code> and <code>matched_entity_ids</code>, the latter a comma-separated list of S2/S3 ids, empty for a singleton. <code>load_split()</code> parses it into a dictionary of sets, dropping empty tokens. There is no test ground truth.</dd>
+  </dl>
+<pre><code>source1_entity_id	matched_entity_ids
+S1-00001	S2-00047,S3-00812
+S1-00002	S3-00004
+S1-00003	</code></pre>
+  <dl>
+    <dt><code>output/matching_results.tsv</code></dt>
+    <dd>Same shape as the ground truth: one row per test S1 entity in file order, <code>matched_entity_ids</code> de-duplicated by <code>dict.fromkeys()</code> and empty for predicted singletons. The singleton row is written as the id, a tab and a newline. This is the only file scored on the leaderboard.</dd>
+    <dt><code>output/candidate_pairs.tsv</code></dt>
+    <dd>Header <code>source1_entity_id</code>, <code>candidate_entity_ids</code>; one row per test S1 entity listing every S2/S3 record in the candidate table <code>fte</code>, i.e. exactly the rows scored by <code>model.predict()</code>. Matches are a subset by construction.</dd>
+  </dl>
+<pre><code>source1_entity_id	candidate_entity_ids
+S1-00001	S2-00047,S2-00193,S3-00812,S3-00999
+S1-00002	S3-00004
+S1-00003	</code></pre>
+  <aside class="note"><strong>Design note.</strong> <code>validate_submission.py</code> (standard library only) enforces the rules the writer relies on: exact header, exactly two tab-separated columns per row, no quote characters, every test S1 id exactly once and no unknown S1 id, no empty or whitespace-padded token, S2-/S3- prefixes that exist in the test set, no duplicate token within a list, and matches ⊆ candidates when <code>--candidate</code> is given. A <code>PASS</code> (exit code 0) from the validator is the packaging gate (see Chapter 11); it does not compute the score.</aside>
+
+  <h2>15.4 Appendix D: Glossary</h2>
+  <p>Table 15.3 defines the vocabulary used in this document. Where a term names a specific construct in the code, the construct is given.</p>
+  <table class="tbl">
+    <caption>Table 15.3 — Glossary of terms</caption>
+    <thead><tr><th>Term</th><th>Definition</th></tr></thead>
+    <tbody>
+      <tr><td>Entity resolution (ER)</td><td>Determining which records, from one or more sources without shared keys, refer to the same real-world entity; here, linking S1 businesses to S2/S3 records.</td></tr>
+      <tr><td>Deduplicated reference source</td><td>Source 1, in which each business appears once; justifies assigning every S2/S3 record to at most one S1 entity in <code>decode_table()</code>.</td></tr>
+      <tr><td>Blocking</td><td>Cheap candidate generation that restricts expensive pairwise scoring to a small set of plausible pairs; implemented by <code>block()</code>.</td></tr>
+      <tr><td>Candidate pair</td><td>An (S1 row, S2/S3 row) pair that survives blocking; one row of the table produced by <code>block()</code> and one entry of <code>candidate_pairs.tsv</code>.</td></tr>
+      <tr><td>Recall ceiling</td><td>Fraction of ground-truth pairs present among the candidates; the highest recall any matcher can reach. Logged as <em>blocking recall ceiling</em>.</td></tr>
+      <tr><td>Reduction ratio</td><td>1 − (candidate pairs) / (|S1| × |S2+S3|); the fraction of the full cross product that blocking discards.</td></tr>
+      <tr><td>Blocking oracle</td><td>Macro F<sub>0.5</sub> obtained by predicting exactly the true pairs among the candidates; the score of a perfect matcher.</td></tr>
+      <tr><td>Singleton</td><td>An S1 entity with no true S2/S3 match. Scores 1.0 when the predicted list is empty and 0.0 otherwise.</td></tr>
+      <tr><td>Precision / Recall</td><td>Per entity: true positives divided by predicted ids / by true ids.</td></tr>
+      <tr><td>F<sub>β</sub>, F<sub>0.5</sub></td><td>Weighted harmonic mean of precision and recall; F<sub>0.5</sub> = 1.25·P·R / (0.25·P + R) weights precision twice as much as recall. Implemented by <code>f05()</code>.</td></tr>
+      <tr><td>Macro average</td><td>The metric is computed per S1 entity and averaged with equal weight, singletons included; <code>macro_f05()</code>.</td></tr>
+      <tr><td>Open-set label</td><td>A categorical field whose test values may not appear in training (country: France). The pipeline never enumerates countries; unseen S1 labels fall back to all S2/S3 records.</td></tr>
+      <tr><td>NFKD folding</td><td>Unicode compatibility decomposition followed by dropping non-ASCII code points; turns <code>Société</code> into <code>Societe</code>. First step of <code>basic()</code>.</td></tr>
+      <tr><td>Legal suffix</td><td>A corporate-form token (<code>Ltd</code>, <code>LLC</code>, <code>SARL</code>) carrying no identity information; stripped by <code>core_name()</code> using the <code>LEGAL</code> set.</td></tr>
+      <tr><td>Core name</td><td><code>name_c</code>: the normalised name with legal suffixes removed; the primary text for blocking and name features.</td></tr>
+      <tr><td>DBA / alias marker</td><td>"Doing business as" and equivalents (<code>t/a</code>, <code>a.k.a.</code>, <code>formerly</code>) separating a legal name from a trade name inside one field; split by <code>_ALIAS</code> in <code>name_parts()</code>.</td></tr>
+      <tr><td>ZIP, PIN, code postal</td><td>US 5-digit (+4) postal code, Indian 6-digit Postal Index Number, French 5-digit postal code; all captured by <code>_postal</code>.</td></tr>
+      <tr><td>House number</td><td>The leading digit run of the normalised address (<code>house</code>); compared as a ternary state.</td></tr>
+      <tr><td>TF-IDF</td><td>Term frequency × inverse document frequency weighting of a text vector; here over character n-grams with <code>sublinear_tf</code> (1 + log tf) and <code>min_df=2</code>.</td></tr>
+      <tr><td><code>char_wb</code></td><td>scikit-learn analyser producing character n-grams only inside word boundaries (words padded with spaces), so n-grams never span two tokens.</td></tr>
+      <tr><td>n-gram</td><td>A contiguous sequence of n characters; the vectorisers use n = 2, 3, 4.</td></tr>
+      <tr><td>Cosine similarity</td><td>Dot product of two L2-normalised vectors; equals the sparse matrix product in <code>topk_sparse()</code> and the row-wise product in <code>pair_cos()</code>.</td></tr>
+      <tr><td>L2 normalisation</td><td>Scaling a vector to unit Euclidean length; <code>TfidfVectorizer</code> does this by default.</td></tr>
+      <tr><td>Top-k / <code>argpartition</code></td><td>Selecting the k largest scores per row without a full sort; <code>np.argpartition</code> is O(n) per row and returns the k best indices unordered.</td></tr>
+      <tr><td>Mutual nearest neighbour</td><td>A pair that is the best candidate for both its S1 entity and its S2/S3 record on <code>cos_full</code> (<code>cos_full_gap1 = cos_full_gap2 = 0</code>, <code>rank1 = rank2 = 1</code>).</td></tr>
+      <tr><td>Gap feature</td><td>A pair's feature value minus the maximum over its competitors on one side (<code>*_gap1</code>, <code>*_gap2</code>); zero for the best candidate.</td></tr>
+      <tr><td>Indel ratio (<code>fuzz.ratio</code>)</td><td>Normalised similarity based on insertions and deletions, 0 to 100.</td></tr>
+      <tr><td><code>token_sort_ratio</code></td><td><code>fuzz.ratio</code> after sorting the tokens of both strings; order-insensitive.</td></tr>
+      <tr><td><code>token_set_ratio</code></td><td>Ratio over the intersection and differences of the token sets; tolerant of extra tokens on one side.</td></tr>
+      <tr><td><code>partial_ratio</code></td><td>Best <code>fuzz.ratio</code> of the shorter string against any equal-length window of the longer one; substring matching.</td></tr>
+      <tr><td>Jaro-Winkler</td><td>Character-transposition similarity with a bonus for a common prefix; <code>n_jw</code>.</td></tr>
+      <tr><td>Jaccard</td><td>|A ∩ B| / |A ∪ B| over token sets (<code>jacc()</code>) or digit-run sets (<code>num_overlap</code>).</td></tr>
+      <tr><td>Gradient boosting / LightGBM</td><td>An ensemble of decision trees fitted sequentially to the gradient of the loss; LightGBM is the MIT-licensed implementation used by <code>lgb.train()</code>.</td></tr>
+      <tr><td>GroupKFold</td><td>Cross-validation that keeps all rows sharing a group key (<code>i1</code>) in one fold, so an S1 entity's candidates are never split between training and validation.</td></tr>
+      <tr><td>OOF (out-of-fold)</td><td>Predictions for each row made by the fold model that did not train on it; the basis of the (thr, ratio) sweep.</td></tr>
+      <tr><td>Early stopping</td><td>Halting boosting when the validation loss has not improved for 100 rounds; the mean of the folds' best rounds, scaled by 1.1, sets the refit round count.</td></tr>
+      <tr><td>Threshold (<code>thr</code>) / relative ratio (<code>ratio</code>)</td><td>The two decision parameters of <code>decide()</code>: absolute probability floor and minimum fraction of the best probability within the (S1, source) group.</td></tr>
+      <tr><td>Transitive closure</td><td>Propagating matches along chains (if A~B and B~C then A~C); not applied here because the task is bipartite S1-to-S2/S3, but relevant to the roadmap (see Chapter 14).</td></tr>
+      <tr><td>Cross-encoder</td><td>A transformer that reads both records jointly and outputs a match score; a roadmap option constrained to MIT/Apache-2.0 models of at most 8B parameters.</td></tr>
+      <tr><td>Feature importance (gain)</td><td>Total loss reduction attributed to splits on a feature across all trees; printed for the top 15.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>15.5 Appendix E: Function index</h2>
+  <p>Table 15.4 lists every function defined in <code>er_pipeline.py</code> in source order, with its inputs, outputs and a one-line description. Names beginning with an underscore are private helpers; <code>_acr()</code> is a closure defined inside <code>features()</code>. The stage each function belongs to follows the architecture in Chapter 4.</p>
+  <table class="tbl">
+    <caption>Table 15.4 — Function index of <code>er_pipeline.py</code></caption>
+    <thead><tr><th>Function</th><th>Inputs → outputs</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td><code>log(msg)</code></td><td>str → prints</td><td>Writes <code>[elapsed s] msg</code> to stdout with <code>flush=True</code>.</td></tr>
+      <tr><td><code>find_data_dir(explicit=None)</code></td><td>str or None → str</td><td>Returns the explicit path or searches four roots recursively for <code>train_source1.tsv</code>; raises <code>FileNotFoundError</code>.</td></tr>
+      <tr><td><code>read_tsv(path)</code></td><td>str → DataFrame</td><td>Tab-separated read, all columns as str, no NA parsing, <code>QUOTE_NONE</code>.</td></tr>
+      <tr><td><code>load_split(data_dir, split)</code></td><td>str, "train"/"test" → (S1 df, S2+S3 df, gt dict or None)</td><td>Loads the three source files, concatenates S2 and S3, and parses the ground truth into <code>{s1_id: set(ids)}</code> when present.</td></tr>
+      <tr><td><code>profile(name, s1, other, gt)</code></td><td>str, df, df, dict or None → prints</td><td>Logs counts, country distributions, singleton fraction and match-list statistics; prints three sample rows.</td></tr>
+      <tr><td><code>basic(s)</code></td><td>str → str</td><td>NFKD ASCII fold, lowercase, <code>&amp;</code>→and, <code>@</code>→at, dotted-acronym collapse, punctuation to space, whitespace collapse.</td></tr>
+      <tr><td><code>expand(s, table)</code></td><td>str, dict → str</td><td>Replaces each whitespace token by its table entry when present.</td></tr>
+      <tr><td><code>norm_name(s)</code></td><td>str → str</td><td><code>expand(basic(s), NAME_ABBR)</code>.</td></tr>
+      <tr><td><code>core_name(n)</code></td><td>str → str</td><td>Drops tokens in <code>LEGAL</code>; returns the input unchanged when every token is legal.</td></tr>
+      <tr><td><code>name_parts(raw)</code></td><td>str → list[str]</td><td>Splits the raw name on <code>_ALIAS</code>, core-normalises each part, drops empties; falls back to one element.</td></tr>
+      <tr><td><code>norm_addr(s)</code></td><td>str → str</td><td><code>expand(basic(s), ADDR_ABBR)</code>.</td></tr>
+      <tr><td><code>_addr_nums(a, p)</code></td><td>normalised address, postal → (frozenset of digit runs, house str)</td><td>Digit runs minus the last occurrence of the postal code, unless that code is the leading run and the address string does not end with it (a 5-digit US house number with no ZIP); the first remaining run is returned as the house number.</td></tr>
+      <tr><td><code>prep(df)</code></td><td>DataFrame → DataFrame</td><td>Adds <code>name_n</code>, <code>name_c</code>, <code>name_alts</code>, <code>addr_n</code>, <code>addr_c</code>, <code>postal</code>, <code>nums</code>, <code>house</code>, <code>country_n</code>, <code>src</code>; resets the index so positions are row ids.</td></tr>
+      <tr><td><code>topk_sparse(A, B, k, max_cells=2e7)</code></td><td>CSR, CSR, int → (int64 [n_A, k] indices, float32 [n_A, k] scores)</td><td>Chunked sparse product against <code>B.T</code>, densified, <code>argpartition</code> top-k per row; chunk size derived from |B|.</td></tr>
+      <tr><td><code>pair_cos(A, B, i1, i2, chunk=200_000)</code></td><td>CSR, CSR, index arrays → float32 [n_pairs]</td><td>Row-wise cosine of paired rows in slices of 200k pairs.</td></tr>
+      <tr><td><code>block(s1, other, k_name=25, k_full=25, k_addr=10, k_postal=10)</code></td><td>prepped dfs → DataFrame [i1, i2, cos_name, cos_full, cos_addr]</td><td>Fits three TF-IDF views, retrieves top-k per country (fallback to all records for unseen labels) plus a same-postal name view, unions, de-duplicates, recomputes the three cosines; logs pair count.</td></tr>
+      <tr><td><code>jacc(a, b)</code></td><td>str, str → float</td><td>Jaccard index of whitespace token sets; 0.0 if either is empty.</td></tr>
+      <tr><td><code>features(cand, s1, other)</code></td><td>candidate df, prepped dfs → DataFrame</td><td>Adds string, token, alias, acronym, postal, number, length, source and context features (gap, rank, count) to the candidate table.</td></tr>
+      <tr><td><code>_acr(n)</code> (inside <code>features()</code>)</td><td>str → str</td><td>Initials of the tokens of a name, for the <code>n_acronym</code> flag.</td></tr>
+      <tr><td><code>f05(pred, truth)</code></td><td>set, set → float</td><td>Per-entity F<sub>0.5</sub> with the singleton rule (empty truth: 1.0 iff empty prediction).</td></tr>
+      <tr><td><code>decode_table(f, prob)</code></td><td>feature df, probabilities → DataFrame [i1, i2, is_s3, p, best]</td><td>Assigns each S2/S3 row to its highest-probability S1 and records the group maximum per (S1, source).</td></tr>
+      <tr><td><code>decide(d, thr, ratio=0.0)</code></td><td>decoded df, float, float → DataFrame</td><td>Keeps rows with <code>p &gt;= thr</code> and <code>p &gt;= ratio * best</code>.</td></tr>
+      <tr><td><code>to_lists(d, s1, other, col="i2")</code></td><td>df with i1 and col, prepped dfs → dict {s1_id: [ids]}</td><td>Converts row indices to entity-id lists, with an entry (possibly empty) for every S1 entity.</td></tr>
+      <tr><td><code>macro_f05(lists, gt, keys)</code></td><td>dict, dict, iterable → float</td><td>Mean of <code>f05()</code> over the given S1 ids.</td></tr>
+      <tr><td><code>main()</code></td><td>argv → files and log</td><td>Orchestrates load, profile, prep, blocking, labelling, cross-validation, sweep, refit, test inference, decoding and TSV writing.</td></tr>
+    </tbody>
+  </table>
+</section>

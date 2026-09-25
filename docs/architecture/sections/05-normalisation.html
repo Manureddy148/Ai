@@ -1,0 +1,298 @@
+<section class="chapter" id="ch-05">
+  <h1><span class="num">5</span> Text Normalisation Layer</h1>
+  <p class="lead">This chapter specifies the normalisation layer implemented by <code>prep()</code> in <code>er_pipeline.py</code>: the deterministic rewriting of every raw <code>business_name</code>, <code>business_address</code> and <code>country</code> value into the canonical columns that blocking (see Chapter 6) and pair feature engineering (see Chapter 7) consume. <code>basic()</code> operates on characters, <code>expand()</code> on tokens against four fixed vocabularies (<code>NAME_ABBR</code>, <code>LEGAL</code>, <code>ADDR_ABBR</code>, <code>ADDR_STOP</code>), and a final tier extracts structured signals that survive text noise: alias variants, postal code, street numbers and house number. Every rule exists to make two spellings of the same business collide while leaving genuine differences visible, the balance the precision-weighted F<sub>0.5</sub> metric demands.</p>
+
+  <h2>5.1 Role of Normalisation in a Precision-Weighted Pipeline</h2>
+  <p>Normalisation is applied identically to Source 1 (S1) and to the concatenated Source 2/3 (S2/S3) frames, on both splits, before any comparison is made. The <em>core name</em> without legal forms drives the TF-IDF blocking views and most name similarities; the <em>full normalised name</em> keeps the legal form so the matcher can still see that <code>acme incorporated</code> and <code>acme llc</code> disagree on a token that sometimes separates two businesses. Under F<sub>0.5</sub> an over-aggressive canonical form raises blocking recall but hides evidence of a false merge, which on a singleton costs a full point (see Chapter 2); the layer therefore canonicalises for recall in the blocking columns and preserves residual detail in parallel columns for precision. All tables are static literals in the source; no geocoder, gazetteer or registry is consulted (see Chapter 13).</p>
+
+  <h2>5.2 Character Tier: basic()</h2>
+  <p><code>basic(s)</code> is the entry point for every text field, including the country label. It applies five operations in a fixed order; the order is load-bearing, as the dotted-acronym rule must run before punctuation is destroyed.</p>
+  <ol>
+    <li><strong>Unicode folding.</strong> <code>unicodedata.normalize("NFKD", str(s))</code> decomposes precomposed characters into base letter plus combining mark and maps compatibility forms (full-width Latin, ligatures) to canonical equivalents; <code>.encode("ascii", "ignore").decode()</code> discards every non-ASCII code point, so accents vanish (<code>Société</code> → <code>Societe</code>); the result is lower-cased.</li>
+    <li><strong>Symbol words.</strong> <code>&amp;</code> becomes <code> and </code> and <code>@</code> becomes <code> at </code>, so <code>A&amp;B Traders</code> and <code>A and B Traders</code> share a token stream.</li>
+    <li><strong>Dotted acronyms.</strong> <code>_dotted</code> collapses <code>u.s.a</code> into <code>usa</code> and <code>p.v.t.</code> into <code>pvt</code> (Section 5.2.1).</li>
+    <li><strong>Punctuation stripping.</strong> <code>_punct = [^a-z0-9 ]+</code> replaces every run of characters outside lower-case letters, digits and space with one space, so commas, hyphens, apostrophes, slashes and remaining dots become separators.</li>
+    <li><strong>Whitespace.</strong> <code>_space = \s+</code> collapses runs; the result is stripped.</li>
+  </ol>
+
+  <h3>5.2.1 The _dotted regex</h3>
+  <pre><code>_dotted = (?&lt;![a-z])(?:[a-z]\.){2,}[a-z]?(?![a-z])</code></pre>
+  <dl>
+    <dt><code>(?&lt;![a-z])</code></dt><dd>Negative look-behind: the match may not start right after a letter, so the tail of an ordinary word is never mistaken for an acronym (<code>abs.c.d</code> is left alone).</dd>
+    <dt><code>(?:[a-z]\.){2,}</code></dt><dd>At least two <em>letter-dot</em> units, the signature of a dotted acronym; a single unit such as <code>no.</code> or <code>bros.</code> does not qualify and falls through to the punctuation rule.</dd>
+    <dt><code>[a-z]?</code></dt><dd>An optional final letter without its dot, so that <code>u.s.a</code> (no trailing dot) is captured whole rather than leaving a dangling <code>a</code>.</dd>
+    <dt><code>(?![a-z])</code></dt><dd>Negative look-ahead: the acronym must end at a non-letter. In <code>a.b.cdef</code> the optional letter cannot be consumed, no match occurs, and the string degrades harmlessly to <code>a b cdef</code>.</dd>
+  </dl>
+  <p>The replacement removes the dots inside the matched span only: <code>u.s.a</code> → <code>usa</code>, <code>l.l.c.</code> → <code>llc</code>, <code>m.g. rd</code> → <code>mg rd</code>. Without this step the punctuation rule would produce <code>p v t</code>, three single-letter tokens that never hit the <code>pvt → private</code> expansion or the <code>LEGAL</code> filter and add spurious word boundaries to the n-gram vectors; collapsing them first lets <code>P.V.T. Ltd.</code>, <code>Pvt Ltd</code> and <code>Private Limited</code> converge on one core name.</p>
+
+  <h2>5.3 Token Tier: expand() and the Four Vocabularies</h2>
+  <p><code>expand(s, table)</code> splits the string on spaces and replaces each token by <code>table.get(t, t)</code>: an exact whole-token lookup with identity fall-back. It never matches inside a token, which is why the glued form <code>pvtltd</code> has its own entry. The two abbreviation tables apply to different fields, so the shared key <code>ste</code> resolves to <code>societe</code> in names and <code>suite</code> in addresses without conflict.</p>
+
+  <table class="tbl">
+    <caption>Table 5.1 — NAME_ABBR: whole-token expansions applied by norm_name()</caption>
+    <thead><tr><th>Token</th><th>Expansion</th><th>Group and rationale</th></tr></thead>
+    <tbody>
+      <tr><td><code>corp</code></td><td>corporation</td><td rowspan="4">US legal forms. Expansion makes <code>Corp</code>/<code>Corporation</code>, <code>Inc</code>/<code>Incorporated</code> identical in <code>name_n</code>; the expanded word is then in <code>LEGAL</code>, so it is removed from the core name.</td></tr>
+      <tr><td><code>co</code></td><td>company</td></tr>
+      <tr><td><code>inc</code></td><td>incorporated</td></tr>
+      <tr><td><code>ltd</code></td><td>limited</td></tr>
+      <tr><td><code>pvt</code></td><td>private</td><td rowspan="2">Indian legal forms; <code>pvtltd</code> covers the frequently glued spelling that whole-token lookup would otherwise miss.</td></tr>
+      <tr><td><code>pvtltd</code></td><td>private limited</td></tr>
+      <tr><td><code>intl</code></td><td>international</td><td rowspan="10">Generic descriptive abbreviations that appear in one source and are spelled out in another. These words are <em>not</em> in <code>LEGAL</code>, so they stay in the core name and contribute to similarity.</td></tr>
+      <tr><td><code>mfg</code></td><td>manufacturing</td></tr>
+      <tr><td><code>svc</code></td><td>services</td></tr>
+      <tr><td><code>svcs</code></td><td>services</td></tr>
+      <tr><td><code>bros</code></td><td>brothers</td></tr>
+      <tr><td><code>assoc</code></td><td>associates</td></tr>
+      <tr><td><code>natl</code></td><td>national</td></tr>
+      <tr><td><code>tech</code></td><td>technologies</td></tr>
+      <tr><td><code>grp</code></td><td>group</td></tr>
+      <tr><td><code>ent</code></td><td>enterprises</td></tr>
+      <tr><td><code>cie</code></td><td>compagnie</td><td rowspan="2">French forms for the unseen test country. <code>Cie</code> and <code>Sté</code> (after accent folding <code>ste</code>) are the usual abbreviations of <em>Compagnie</em> and <em>Société</em>; both expansions are in <code>LEGAL</code>.</td></tr>
+      <tr><td><code>ste</code></td><td>societe</td></tr>
+    </tbody>
+  </table>
+
+  <table class="tbl">
+    <caption>Table 5.2 — LEGAL: tokens removed by core_name()</caption>
+    <thead><tr><th>Group</th><th>Tokens</th><th>Rationale</th></tr></thead>
+    <tbody>
+      <tr><td>US / common-law forms</td><td><code>corporation company incorporated llc llp lp plc pllc</code></td><td>Sources omit, abbreviate or swap legal forms; removing them stops <code>Acme</code> and <code>Acme Incorporated</code> from differing on more than half of their characters in the edit-distance features.</td></tr>
+      <tr><td>Indian forms</td><td><code>private limited pvt opc</code></td><td><code>limited</code> is shared with UK-style names; <code>opc</code> is the one-person company; <code>pvt</code> is defensive, since expansion normally rewrites it first.</td></tr>
+      <tr><td>Function words</td><td><code>the and of</code></td><td>Optional in practice (<code>Bank of India</code> vs <code>Bank India</code>); dropping <code>of</code> also lets the acronym feature in Chapter 7 compare <code>sbi</code> with <code>state bank india</code>.</td></tr>
+      <tr><td>Alias residue</td><td><code>dba</code></td><td>Belt-and-braces removal in case a marker survives the raw-string split of Section 5.4.</td></tr>
+      <tr><td>French forms</td><td><code>sarl sas sasu sa eurl sci snc societe compagnie et</code></td><td>Company types (SARL, SAS, SASU, SA, EURL, SCI, SNC), the words <em>Société</em> and <em>Compagnie</em>, and the conjunction <em>et</em>. France never appears in training, so this list is the only mechanism that makes French core names comparable at test time.</td></tr>
+    </tbody>
+  </table>
+
+  <table class="tbl">
+    <caption>Table 5.3 — ADDR_ABBR: whole-token expansions applied by norm_addr()</caption>
+    <thead><tr><th>Group</th><th>Token → expansion</th><th>Rationale</th></tr></thead>
+    <tbody>
+      <tr><td>Street types</td><td><code>rd</code>→road, <code>st</code>→street, <code>str</code>→street, <code>ave</code>→avenue, <code>av</code>→avenue, <code>blvd</code>→boulevard, <code>dr</code>→drive, <code>ln</code>→lane, <code>hwy</code>→highway, <code>pkwy</code>→parkway, <code>ct</code>→court, <code>pl</code>→place, <code>sq</code>→square</td><td>The <code>Rd</code>/<code>Road</code> family named in the problem statement; both spellings must yield identical <code>addr_c</code> tokens.</td></tr>
+      <tr><td>Unit designators</td><td><code>ste</code>→suite, <code>apt</code>→apartment, <code>fl</code>→floor, <code>flr</code>→floor, <code>bldg</code>→building</td><td>Secondary-address components that one source spells out and another abbreviates.</td></tr>
+      <tr><td>Compass points</td><td><code>n</code>→north, <code>s</code>→south, <code>e</code>→east, <code>w</code>→west, <code>ne</code>→northeast, <code>nw</code>→northwest, <code>se</code>→southeast, <code>sw</code>→southwest</td><td>US municipal numbering (<code>1420 N Main St</code>); a single-letter token carries almost no n-gram mass, so expansion is needed for it to count at all.</td></tr>
+      <tr><td>Indian idioms</td><td><code>nr</code>→near, <code>opp</code>→opposite, <code>mg</code>→mahatma gandhi, <code>ngr</code>→nagar, <code>clny</code>→colony, <code>sec</code>→sector, <code>mkt</code>→market, <code>stn</code>→station, <code>chowk</code>→chowk, <code>marg</code>→road, <code>salai</code>→road</td><td>Landmark prefixes (<code>Nr</code>, <code>Opp</code>) are expanded so that <code>ADDR_STOP</code> can drop them; <code>marg</code> (Hindi) and <code>salai</code> (Tamil) are mapped onto <code>road</code> so a transliterated street type agrees with its English variant. <code>chowk</code> is an identity entry that documents a deliberately retained token.</td></tr>
+      <tr><td>French idioms</td><td><code>bd</code>→boulevard, <code>fbg</code>→faubourg, <code>chem</code>→chemin, <code>imp</code>→impasse</td><td>Common French street-type abbreviations, added so that the unseen country is not handled worse than the training countries.</td></tr>
+    </tbody>
+  </table>
+
+  <table class="tbl">
+    <caption>Table 5.4 — ADDR_STOP: tokens removed from addr_n to form addr_c</caption>
+    <thead><tr><th>Tokens</th><th>Role</th><th>Why they are dropped</th></tr></thead>
+    <tbody>
+      <tr><td><code>near opposite behind beside next to</code></td><td>Landmark relations</td><td>A landmark reference (<em>Near SBI ATM</em>) describes position, not identity; the relation word adds shared n-grams to every address in the neighbourhood and inflates cosine between different businesses.</td></tr>
+      <tr><td><code>the of and</code></td><td>English function words</td><td>Optional, high-frequency, carry no locating information.</td></tr>
+      <tr><td><code>no number</code></td><td>Number prefixes</td><td><code>Plot No. 12</code> and <code>Plot 12</code> must agree; the digit is kept by <code>_addr_nums()</code>, the prefix is noise.</td></tr>
+      <tr><td><code>de la le du des</code></td><td>French articles</td><td><code>Rue de la Paix</code> vs <code>Rue Paix</code>; articles dominate French token counts and would otherwise make every French address resemble every other.</td></tr>
+    </tbody>
+  </table>
+
+  <aside class="note"><strong>Design note.</strong> Whole-token expansion has known side effects: <code>St. Louis</code> becomes <code>street louis</code>, a possessive <code>s</code> in an address becomes <code>south</code>, <code>co-op</code> becomes <code>company op</code>. These rewrites hit both sides of every pair identically, so they create no asymmetric disagreement; the tables trade a little semantic distortion for a large gain in collision rate on the abbreviation patterns the problem statement lists.</aside>
+
+  <h2>5.4 Name Columns: norm_name(), core_name() and name_parts()</h2>
+  <p><code>norm_name(s)</code> is <code>expand(basic(s), NAME_ABBR)</code>. <code>core_name(n)</code> removes every token in <code>LEGAL</code> and, if nothing remains (<code>The Company</code>), returns the full normalised name instead: an empty core name would yield an all-zero TF-IDF row in the <code>name</code> blocking view, a name-blind row in the <code>full</code> view and zero for every name similarity, leaving the address alone to find and confirm a match.</p>
+  <h3>5.4.1 The _ALIAS regex and why it runs on the raw string</h3>
+  <pre><code>_ALIAS = \b(?:d\s*/\s*b\s*/\s*a | d\.b\.a\.? | dba | doing business as | trading as
+          | t\s*/\s*a | a\s*/\s*k\s*/\s*a | a\.k\.a\.? | also known as
+          | formerly(?: known as)?)\b        (flag re.I; spaces added for reading)</code></pre>
+  <p>Each alternative is a marker separating a legal name from a trade name inside one field: the <code>d/b/a</code> family (optional spaces around the slashes, dotted <code>d.b.a</code> with an optional final dot, bare <code>dba</code>, <code>doing business as</code>), the British <code>trading as</code> and <code>t/a</code>, the <code>a/k/a</code> family with <code>also known as</code>, and <code>formerly</code> with or without <code>known as</code>. The <code>\b</code> anchors require a whole word, so <code>t/a</code> does not fire inside <code>Fast/Auto</code>; <code>re.I</code> accepts <code>DBA</code>. Bare <code>aka</code> is deliberately absent: it occurs as a legitimate name element (personal, place and brand names), and a false split would set <code>has_alias</code> and invent a second variant for an entity that has none.</p>
+  <p>The regex runs on the <em>raw</em> field because <code>basic()</code> is destructive: it turns <code>d/b/a</code> and <code>t/a</code> into <code>d b a</code> and <code>t a</code>, sequences indistinguishable from initials, and <code>_dotted</code> collapses <code>a.k.a.</code> into <code>aka</code>, precisely the bare token the regex refuses to match. Splitting first is the only order in which the marker is still recognisable.</p>
+  <p><code>name_parts(raw)</code> splits on <code>_ALIAS</code>, applies <code>core_name(norm_name(·))</code> to each piece, discards empty pieces and falls back to the single core name when nothing survives; the result is <code>name_alts</code>. In <code>prep()</code> the main column <code>name_n</code> is built from the <em>joined</em> pieces (<code>" ".join(_ALIAS.split(s))</code>): legal and trade names are concatenated with the marker removed, so blocking sees both vocabularies in one string and keeps its recall, while <code>n_alias_best</code> in Chapter 7 scores every (variant, variant) pair to reward a record that matches either name alone.</p>
+
+  <h2>5.5 Address Columns: norm_addr(), _postal and _addr_nums()</h2>
+  <p><code>norm_addr(s)</code> is <code>expand(basic(s), ADDR_ABBR)</code> and yields <code>addr_n</code>; removing <code>ADDR_STOP</code> tokens yields <code>addr_c</code>, used by the blocking views and the address similarities.</p>
+  <h3>5.5.1 The _postal regex</h3>
+  <pre><code>_postal = \b(\d{5,6})(?:-\d{4})?\b</code></pre>
+  <p>The capture group requires a run of exactly five or six digits bounded by word boundaries; an optional <code>-dddd</code> suffix is consumed but not captured. <code>prep()</code> applies it to the raw address and keeps the <em>last</em> match, because postal codes conventionally close an address whereas plot and house numbers open it. A US ZIP or ZIP+4 (<code>62704-1234</code>) yields <code>62704</code>; the six-digit Indian PIN (<code>201301</code>) is captured because <code>\d{5,6}</code> is greedy; the five-digit French <code>code postal</code> (<code>75002</code>), which precedes the city name, is captured by the same rule, so the unseen country needs no special case. Runs of seven or more digits (phone numbers) never match, because a word boundary cannot fall inside a digit run. A missing code yields the empty string, which the feature layer encodes as an explicit unknown state rather than a disagreement.</p>
+  <h3>5.5.2 _addr_nums(): digit runs and the house number</h3>
+  <p><code>_addr_nums(a, p)</code> takes the normalised address and the postal code. It collects every digit run with <code>_digits = \d+</code>, removes the last occurrence of the postal code, and returns the frozenset of remaining runs (<code>nums</code>) together with the first <em>remaining</em> run (<code>house</code>); an address whose only digit run is its postal code therefore has an empty <code>house</code>. The removal is guarded by one exact exception:</p>
+  <pre><code>if p and p in ns and (ns[0] != p or a.endswith(p)):
+    drop the last occurrence of p from ns</code></pre>
+  <p>The postal code is removed when it is not the leading number, or when it is the leading number but the address also ends with it. The case that is <em>not</em> removed is a five- or six-digit run that opens the address and does not close it: a US house number such as <code>12345 Main Street</code> on a record whose ZIP is missing. <code>_postal</code> captures that house number as the postal code, and without the guard it would vanish from <code>nums</code>, leaving the record without its most discriminative address token. The guard keeps it as <code>house</code> and in <code>nums</code>, so <code>house_state</code> and <code>num_overlap</code> in Chapter 7 still fire. Under F<sub>0.5</sub> these numeric agreements are the cheapest precision signal available: two records sharing a name but conflicting on a house number are far more often neighbouring branches than one business.</p>
+  <aside class="warn"><strong>Risk.</strong> In the exception case the <code>postal</code> column still holds the house number, so <code>postal_state</code> compares it against the other record's real ZIP and reports <code>-1</code>. Likewise the <code>+4</code> suffix of a ZIP+4 stays in <code>nums</code> as a separate run (<code>1234</code> in the worked example), so a pair where only one side carries the suffix loses some <code>num_overlap</code>. Both effects are systematic and visible to the tree model, but they mark where a rule-based extractor is weaker than a country-aware parser (see Chapter 14).</aside>
+
+  <h2>5.6 prep(): Output Columns and Worked Examples</h2>
+  <p><code>prep(df)</code> copies the frame, adds the columns of Table 5.5 and resets the index so that the integer positions used by <code>block()</code> and <code>features()</code> are dense. Country goes through <code>basic()</code> only: <code>US</code>, <code>India</code> and <code>France</code> become <code>us</code>, <code>india</code> and <code>france</code>, while a variant such as <code>U.S.A.</code> becomes <code>usa</code>, a distinct label that <code>block()</code> pairs with S2/S3 records carrying the same label or, when none exist, resolves through the open-set fallback against every S2/S3 record (see Chapter 6).</p>
+
+  <table class="tbl">
+    <caption>Table 5.5 — Columns produced by prep() and their consumers</caption>
+    <thead><tr><th>Column</th><th>Definition</th><th>Consumed by</th></tr></thead>
+    <tbody>
+      <tr><td><code>name_n</code></td><td><code>norm_name()</code> of the raw name with alias markers removed and the pieces joined; legal forms retained</td><td><code>n_full_ratio</code></td></tr>
+      <tr><td><code>name_c</code></td><td><code>core_name(name_n)</code>: legal forms and function words dropped, fallback to <code>name_n</code></td><td>Blocking views <code>name</code>, <code>full</code>; <code>n_ratio</code>, <code>n_tsort</code>, <code>n_tset</code>, <code>n_partial</code>, <code>n_jw</code>, <code>n_jacc</code>, <code>n_first_eq</code>, <code>n_init_eq</code>, <code>n_acronym</code>, <code>len_l</code>/<code>len_r</code></td></tr>
+      <tr><td><code>name_alts</code></td><td><code>name_parts()</code>: list of core-normalised alias variants</td><td><code>n_alias_best</code>, <code>has_alias</code></td></tr>
+      <tr><td><code>addr_n</code></td><td><code>norm_addr()</code> of the raw address</td><td><code>addr_c</code>, <code>_addr_nums()</code></td></tr>
+      <tr><td><code>addr_c</code></td><td><code>addr_n</code> without <code>ADDR_STOP</code> tokens</td><td>Blocking views <code>full</code>, <code>addr</code>; <code>a_ratio</code>, <code>a_tset</code>, <code>a_partial</code>, <code>a_jacc</code>, <code>alen_l</code>/<code>alen_r</code></td></tr>
+      <tr><td><code>postal</code></td><td>Last <code>_postal</code> match on the raw address, or <code>""</code></td><td>Same-postal blocking view; <code>postal_state</code></td></tr>
+      <tr><td><code>nums</code></td><td>Frozenset of digit runs in <code>addr_n</code> minus the postal code (with the exception of 5.5.2)</td><td><code>num_overlap</code>, <code>num_conflict</code></td></tr>
+      <tr><td><code>house</code></td><td>First digit run of <code>addr_n</code> after the postal-code removal, or <code>""</code></td><td><code>house_state</code></td></tr>
+      <tr><td><code>country_n</code></td><td><code>basic(country)</code></td><td>Per-country partition in <code>block()</code>; recall-by-country log</td></tr>
+      <tr><td><code>src</code></td><td><code>entity_id[:2]</code> (<code>S1</code>, <code>S2</code> or <code>S3</code>)</td><td><code>is_s3</code>; <code>(S1, source)</code> groups in <code>decode_table()</code></td></tr>
+    </tbody>
+  </table>
+
+  <h3>5.6.1 Two records traced through every step</h3>
+  <p>The Indian record is <code>Sharma Bros. P.V.T. Ltd.</code> at <code>Plot No. 12, Nr. SBI ATM, M.G. Rd, Sec 5, Noida 201301</code>; the US record is <code>J &amp; R Auto Repair, L.L.C. d/b/a Jim's Garage</code> at <code>1420 N. Main St., Ste 200, Springfield, IL 62704-1234</code>. Figures 5.1 and 5.2 trace the name and address paths; Table 5.6 lists the final columns. In the Indian name, <code>_dotted</code> rewrites <code>p.v.t.</code> but leaves <code>bros.</code> and <code>ltd.</code> alone because each has a single letter-dot unit; the punctuation rule strips their dots and <code>NAME_ABBR</code> expands all three tokens. In the US name the raw-string alias split yields two variants, and the possessive in <code>Jim's</code> survives as a stray <code>s</code> token, which the token-set similarities of Chapter 7 tolerate.</p>
+
+  <figure>
+    <svg viewBox="0 0 800 420" width="100%" font-family="inherit" font-size="13">
+      <defs>
+        <marker id="ch05-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="#334155"/>
+        </marker>
+      </defs>
+      <rect x="16" y="6" width="180" height="26" rx="6" fill="#f1f5f9" stroke="#334155"/>
+      <text x="106" y="24" text-anchor="middle" fill="#0f172a">Step</text>
+      <rect x="212" y="6" width="280" height="26" rx="6" fill="#f1f5f9" stroke="#334155"/>
+      <text x="352" y="24" text-anchor="middle" fill="#0f172a">Indian record</text>
+      <rect x="508" y="6" width="280" height="26" rx="6" fill="#f1f5f9" stroke="#334155"/>
+      <text x="648" y="24" text-anchor="middle" fill="#0f172a">US record</text>
+
+      <rect x="16" y="44" width="180" height="60" rx="6" fill="#dbeafe" stroke="#334155"/>
+      <text x="26" y="68" fill="#0f172a">business_name</text>
+      <text x="26" y="86" fill="#0f172a">(raw field)</text>
+      <rect x="212" y="44" width="280" height="60" rx="6" fill="#fef3c7" stroke="#334155"/>
+      <text x="222" y="68" fill="#0f172a">Sharma Bros. P.V.T. Ltd.</text>
+      <rect x="508" y="44" width="280" height="60" rx="6" fill="#dcfce7" stroke="#334155"/>
+      <text x="518" y="68" fill="#0f172a">J &amp; R Auto Repair, L.L.C.</text>
+      <text x="518" y="86" fill="#0f172a">d/b/a Jim's Garage</text>
+      <line x1="106" y1="104" x2="106" y2="120" stroke="#334155" stroke-width="1.5" marker-end="url(#ch05-arrow)"/>
+
+      <rect x="16" y="120" width="180" height="60" rx="6" fill="#dbeafe" stroke="#334155"/>
+      <text x="26" y="144" fill="#0f172a">_ALIAS.split, join</text>
+      <text x="26" y="162" fill="#0f172a">basic()</text>
+      <rect x="212" y="120" width="280" height="60" rx="6" fill="#fef3c7" stroke="#334155"/>
+      <text x="222" y="144" fill="#0f172a">sharma bros pvt ltd</text>
+      <text x="222" y="162" fill="#0f172a">(_dotted: p.v.t. -&gt; pvt)</text>
+      <rect x="508" y="120" width="280" height="60" rx="6" fill="#dcfce7" stroke="#334155"/>
+      <text x="518" y="144" fill="#0f172a">j and r auto repair llc jim s garage</text>
+      <text x="518" y="162" fill="#0f172a">(&amp; -&gt; and; l.l.c. -&gt; llc)</text>
+      <line x1="106" y1="180" x2="106" y2="196" stroke="#334155" stroke-width="1.5" marker-end="url(#ch05-arrow)"/>
+
+      <rect x="16" y="196" width="180" height="60" rx="6" fill="#dbeafe" stroke="#334155"/>
+      <text x="26" y="220" fill="#0f172a">expand(NAME_ABBR)</text>
+      <text x="26" y="238" fill="#0f172a">= name_n</text>
+      <rect x="212" y="196" width="280" height="60" rx="6" fill="#fef3c7" stroke="#334155"/>
+      <text x="222" y="220" fill="#0f172a">sharma brothers private limited</text>
+      <text x="222" y="238" fill="#0f172a">(bros, pvt, ltd expanded)</text>
+      <rect x="508" y="196" width="280" height="60" rx="6" fill="#dcfce7" stroke="#334155"/>
+      <text x="518" y="220" fill="#0f172a">j and r auto repair llc jim s garage</text>
+      <text x="518" y="238" fill="#0f172a">(no table hit)</text>
+      <line x1="106" y1="256" x2="106" y2="272" stroke="#334155" stroke-width="1.5" marker-end="url(#ch05-arrow)"/>
+
+      <rect x="16" y="272" width="180" height="60" rx="6" fill="#dbeafe" stroke="#334155"/>
+      <text x="26" y="296" fill="#0f172a">core_name()</text>
+      <text x="26" y="314" fill="#0f172a">= name_c</text>
+      <rect x="212" y="272" width="280" height="60" rx="6" fill="#fef3c7" stroke="#334155"/>
+      <text x="222" y="296" fill="#0f172a">sharma brothers</text>
+      <text x="222" y="314" fill="#0f172a">(private, limited in LEGAL)</text>
+      <rect x="508" y="272" width="280" height="60" rx="6" fill="#dcfce7" stroke="#334155"/>
+      <text x="518" y="296" fill="#0f172a">j r auto repair jim s garage</text>
+      <text x="518" y="314" fill="#0f172a">(and, llc in LEGAL)</text>
+      <line x1="106" y1="332" x2="106" y2="348" stroke="#334155" stroke-width="1.5" marker-end="url(#ch05-arrow)"/>
+
+      <rect x="16" y="348" width="180" height="60" rx="6" fill="#dbeafe" stroke="#334155"/>
+      <text x="26" y="372" fill="#0f172a">name_parts()</text>
+      <text x="26" y="390" fill="#0f172a">= name_alts</text>
+      <rect x="212" y="348" width="280" height="60" rx="6" fill="#fef3c7" stroke="#334155"/>
+      <text x="222" y="372" fill="#0f172a">[sharma brothers]</text>
+      <text x="222" y="390" fill="#0f172a">(one variant)</text>
+      <rect x="508" y="348" width="280" height="60" rx="6" fill="#dcfce7" stroke="#334155"/>
+      <text x="518" y="372" fill="#0f172a">[j r auto repair, jim s garage]</text>
+      <text x="518" y="390" fill="#0f172a">(two variants, has_alias = 1)</text>
+    </svg>
+    <figcaption>Figure 5.1 — Name normalisation flow: the Indian and US worked records at each step from the raw <code>business_name</code> to <code>name_n</code>, <code>name_c</code> and <code>name_alts</code>. The alias split runs on the raw string before <code>basic()</code>.</figcaption>
+  </figure>
+
+  <figure>
+    <svg viewBox="0 0 800 420" width="100%" font-family="inherit" font-size="13">
+      <defs>
+        <marker id="ch05-arrow2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="#334155"/>
+        </marker>
+      </defs>
+      <rect x="16" y="6" width="180" height="26" rx="6" fill="#f1f5f9" stroke="#334155"/>
+      <text x="106" y="24" text-anchor="middle" fill="#0f172a">Step</text>
+      <rect x="212" y="6" width="280" height="26" rx="6" fill="#f1f5f9" stroke="#334155"/>
+      <text x="352" y="24" text-anchor="middle" fill="#0f172a">Indian record</text>
+      <rect x="508" y="6" width="280" height="26" rx="6" fill="#f1f5f9" stroke="#334155"/>
+      <text x="648" y="24" text-anchor="middle" fill="#0f172a">US record</text>
+
+      <rect x="16" y="44" width="180" height="60" rx="6" fill="#dbeafe" stroke="#334155"/>
+      <text x="26" y="68" fill="#0f172a">business_address</text>
+      <text x="26" y="86" fill="#0f172a">(raw field)</text>
+      <rect x="212" y="44" width="280" height="60" rx="6" fill="#fef3c7" stroke="#334155"/>
+      <text x="222" y="68" fill="#0f172a">Plot No. 12, Nr. SBI ATM, M.G. Rd,</text>
+      <text x="222" y="86" fill="#0f172a">Sec 5, Noida 201301</text>
+      <rect x="508" y="44" width="280" height="60" rx="6" fill="#dcfce7" stroke="#334155"/>
+      <text x="518" y="68" fill="#0f172a">1420 N. Main St., Ste 200,</text>
+      <text x="518" y="86" fill="#0f172a">Springfield, IL 62704-1234</text>
+      <line x1="106" y1="104" x2="106" y2="120" stroke="#334155" stroke-width="1.5" marker-end="url(#ch05-arrow2)"/>
+
+      <rect x="16" y="120" width="180" height="60" rx="6" fill="#dbeafe" stroke="#334155"/>
+      <text x="26" y="144" fill="#0f172a">basic()</text>
+      <text x="26" y="162" fill="#0f172a">fold, dotted, punct</text>
+      <rect x="212" y="120" width="280" height="60" rx="6" fill="#fef3c7" stroke="#334155"/>
+      <text x="222" y="144" fill="#0f172a">plot no 12 nr sbi atm mg rd</text>
+      <text x="222" y="162" fill="#0f172a">sec 5 noida 201301  (m.g. -&gt; mg)</text>
+      <rect x="508" y="120" width="280" height="60" rx="6" fill="#dcfce7" stroke="#334155"/>
+      <text x="518" y="144" fill="#0f172a">1420 n main st ste 200</text>
+      <text x="518" y="162" fill="#0f172a">springfield il 62704 1234</text>
+      <line x1="106" y1="180" x2="106" y2="196" stroke="#334155" stroke-width="1.5" marker-end="url(#ch05-arrow2)"/>
+
+      <rect x="16" y="196" width="180" height="60" rx="6" fill="#dbeafe" stroke="#334155"/>
+      <text x="26" y="220" fill="#0f172a">expand(ADDR_ABBR)</text>
+      <text x="26" y="238" fill="#0f172a">= addr_n</text>
+      <rect x="212" y="196" width="280" height="60" rx="6" fill="#fef3c7" stroke="#334155"/>
+      <text x="222" y="220" fill="#0f172a">plot no 12 near sbi atm mahatma</text>
+      <text x="222" y="238" fill="#0f172a">gandhi road sector 5 noida 201301</text>
+      <rect x="508" y="196" width="280" height="60" rx="6" fill="#dcfce7" stroke="#334155"/>
+      <text x="518" y="220" fill="#0f172a">1420 north main street suite 200</text>
+      <text x="518" y="238" fill="#0f172a">springfield il 62704 1234</text>
+      <line x1="106" y1="256" x2="106" y2="272" stroke="#334155" stroke-width="1.5" marker-end="url(#ch05-arrow2)"/>
+
+      <rect x="16" y="272" width="180" height="60" rx="6" fill="#dbeafe" stroke="#334155"/>
+      <text x="26" y="296" fill="#0f172a">drop ADDR_STOP</text>
+      <text x="26" y="314" fill="#0f172a">= addr_c</text>
+      <rect x="212" y="272" width="280" height="60" rx="6" fill="#fef3c7" stroke="#334155"/>
+      <text x="222" y="296" fill="#0f172a">plot 12 sbi atm mahatma gandhi</text>
+      <text x="222" y="314" fill="#0f172a">road sector 5 noida 201301</text>
+      <rect x="508" y="272" width="280" height="60" rx="6" fill="#dcfce7" stroke="#334155"/>
+      <text x="518" y="296" fill="#0f172a">1420 north main street suite 200</text>
+      <text x="518" y="314" fill="#0f172a">springfield il 62704 1234 (none)</text>
+      <line x1="106" y1="332" x2="106" y2="348" stroke="#334155" stroke-width="1.5" marker-end="url(#ch05-arrow2)"/>
+
+      <rect x="16" y="348" width="180" height="60" rx="6" fill="#dbeafe" stroke="#334155"/>
+      <text x="26" y="372" fill="#0f172a">_postal on raw,</text>
+      <text x="26" y="390" fill="#0f172a">_addr_nums(addr_n, p)</text>
+      <rect x="212" y="348" width="280" height="60" rx="6" fill="#fef3c7" stroke="#334155"/>
+      <text x="222" y="372" fill="#0f172a">postal 201301   house 12</text>
+      <text x="222" y="390" fill="#0f172a">nums {12, 5}; PIN dropped</text>
+      <rect x="508" y="348" width="280" height="60" rx="6" fill="#dcfce7" stroke="#334155"/>
+      <text x="518" y="372" fill="#0f172a">postal 62704   house 1420</text>
+      <text x="518" y="390" fill="#0f172a">nums {1420, 200, 1234}; ZIP dropped</text>
+      <line x1="8" y1="74" x2="8" y2="378" stroke="#334155" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ch05-arrow2)"/>
+    </svg>
+    <figcaption>Figure 5.2 — Address normalisation flow for the same two records. The dashed line marks that <code>_postal</code> reads the raw address (step 1) while <code>_addr_nums()</code> reads <code>addr_n</code> (step 3); both feed the final row.</figcaption>
+  </figure>
+
+  <table class="tbl">
+    <caption>Table 5.6 — prep() output for the two worked records</caption>
+    <thead><tr><th>Column</th><th>Indian record</th><th>US record</th></tr></thead>
+    <tbody>
+      <tr><td><code>name_n</code></td><td><code>sharma brothers private limited</code></td><td><code>j and r auto repair llc jim s garage</code></td></tr>
+      <tr><td><code>name_c</code></td><td><code>sharma brothers</code></td><td><code>j r auto repair jim s garage</code></td></tr>
+      <tr><td><code>name_alts</code></td><td><code>["sharma brothers"]</code></td><td><code>["j r auto repair", "jim s garage"]</code></td></tr>
+      <tr><td><code>addr_n</code></td><td><code>plot no 12 near sbi atm mahatma gandhi road sector 5 noida 201301</code></td><td><code>1420 north main street suite 200 springfield il 62704 1234</code></td></tr>
+      <tr><td><code>addr_c</code></td><td><code>plot 12 sbi atm mahatma gandhi road sector 5 noida 201301</code></td><td><code>1420 north main street suite 200 springfield il 62704 1234</code></td></tr>
+      <tr><td><code>postal</code></td><td><code>201301</code></td><td><code>62704</code></td></tr>
+      <tr><td><code>nums</code></td><td><code>{12, 5}</code></td><td><code>{1420, 200, 1234}</code></td></tr>
+      <tr><td><code>house</code></td><td><code>12</code></td><td><code>1420</code></td></tr>
+      <tr><td><code>country_n</code></td><td><code>india</code></td><td><code>us</code></td></tr>
+      <tr><td><code>src</code></td><td><code>S1</code> (from the id prefix)</td><td><code>S1</code> (from the id prefix)</td></tr>
+    </tbody>
+  </table>
+
+  <p>Both traces are derived by hand from the regexes and tables above; the pipeline has not yet been executed on the challenge data, so corpus-level statistics of this layer (share of records with a postal code, an alias marker or an empty core name) are to be filled from the run log (see Chapter 10). Table 5.5, together with the raw <code>entity_id</code> and <code>country</code> columns read by <code>main()</code> for output and logging, is the complete interface to the rest of the system: any change to a table or regex here alters the feature distribution the LightGBM matcher (see Chapter 8) is trained on and requires retraining and a threshold re-sweep (see Chapter 9).</p>
+</section>

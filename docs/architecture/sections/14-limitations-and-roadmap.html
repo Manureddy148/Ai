@@ -1,0 +1,159 @@
+<section class="chapter" id="ch-14">
+  <h1><span class="num">14</span> Limitations, Risks and Roadmap</h1>
+  <p class="lead">The pipeline of Chapters 4 to 11 is a complete baseline, but it has not yet been executed on the real data, and several design choices are deliberate simplifications. This chapter states those limitations plainly, quantifies where possible how each bounds the macro F<sub>0.5</sub> score, records the operational risks with likelihood, impact and mitigation, and lays out a three-horizon roadmap in which every item is gated on the out-of-fold (OOF) validation score of Chapter 10.</p>
+
+  <h2>14.1 Status of the evidence</h2>
+  <p>Every quantitative claim in this document is a property of the code, a bound derived from the metric, or a placeholder marked "to be filled from the run log". <code>er_pipeline.py</code> has been smoke-tested only on the synthetic set produced by <code>utils/make_synthetic_dataset.py</code>: every stage of <code>main()</code> runs and the outputs pass <code>utils/validate_submission.py</code>. No blocking recall ceiling, OOF macro F<sub>0.5</sub> or per-country test match rate has been observed on the challenge data. The values the code carries (<code>k_name=25</code>, <code>k_full=25</code>, <code>k_addr=10</code>, <code>k_postal=10</code>, the <code>0.05</code> cosine floor, <code>num_leaves=63</code>, the sweep grid) are informed defaults, not tuned values.</p>
+  <aside class="warn"><strong>Risk.</strong> Until the first full run completes, the expected score is unknown. The log lines that <code>main()</code> prints (recall ceiling overall, by country and by source; all-candidates floor; blocking oracle ceiling; OOF macro F<sub>0.5</sub> with the selected <code>thr</code> and <code>ratio</code>) are the first evidence to collect; every roadmap item in Section 14.4 is judged against them.</aside>
+
+  <h2>14.2 Limitations</h2>
+  <p>Table 14.1 lists each limitation, the mechanism by which it affects the macro F<sub>0.5</sub> of Chapter 2, and the mitigation the roadmap assigns to it. The subsections explain the mechanisms in order of expected effect on the score.</p>
+  <table class="tbl">
+    <caption>Table 14.1 — Limitations, their effect on macro F<sub>0.5</sub>, and planned mitigation</caption>
+    <thead><tr><th>Limitation</th><th>Where in the code</th><th>Effect on F<sub>0.5</sub></th><th>Mitigation (horizon)</th></tr></thead>
+    <tbody>
+      <tr><td>Not yet run on real data</td><td>whole of <code>main()</code></td><td>Score unknown; defaults untuned</td><td>First run; fill the run-log placeholders against Table 15.2 (H1)</td></tr>
+      <tr><td>Recall bounded by fixed top-k blocking</td><td><code>block()</code>, <code>topk_sparse()</code></td><td>A missed true pair caps the entity at F<sub>0.5</sub> = 1.25R/(0.25+R); a one-match entity scores 0</td><td>Phonetic keys, embedding view (H1, H2)</td></tr>
+      <tr><td>Hand-built abbreviation tables</td><td><code>NAME_ABBR</code>, <code>ADDR_ABBR</code>, <code>LEGAL</code></td><td>Uncovered variants lower the string features; false expansions (<code>st</code>, <code>pl</code>, <code>ste</code>) add noise</td><td>Cross-encoder re-ranker; country-adaptive normalisation (H2, H3)</td></tr>
+      <tr><td>No transliteration model; non-ASCII dropped</td><td><code>basic()</code> NFKD + ASCII <code>ignore</code></td><td>Latin-script variants rely on n-gram overlap only; fully non-Latin strings become empty and are never blocked</td><td>Phonetic keys; multilingual encoder (H1, H2)</td></tr>
+      <tr><td>France unseen in training</td><td><code>gt</code> covers US and India only</td><td><code>thr</code>, <code>ratio</code> and tree splits calibrated on two countries; French error rate unmeasured</td><td>Pseudo-unseen validation; per-country <code>(thr, ratio)</code> (H1, H2)</td></tr>
+      <tr><td>Context features depend on candidate-set composition</td><td><code>features()</code> <code>groupby("i1")</code>/<code>("i2")</code></td><td><code>gap</code>, <code>rank</code>, <code>n_cand</code> shift when block sizes or k change between train and test</td><td>Refit whenever k changes; monitor <code>n_cand1</code> distribution (H1)</td></tr>
+      <tr><td>Single global <code>(thr, ratio)</code></td><td>sweep in <code>main()</code>, <code>decide()</code></td><td>Optimal operating point differs by country and source; global value is a compromise</td><td>Per-country and per-source sweep (H1)</td></tr>
+      <tr><td>No transitive consistency</td><td><code>decode_table()</code>, <code>decide()</code></td><td>Two accepted S2/S3 records of one S1 may contradict each other; false positives on multi-match entities</td><td>Graph decoding per connected component (H3)</td></tr>
+      <tr><td>Python-loop feature computation</td><td><code>features()</code> list comprehensions</td><td>No effect on score; bounds the candidate volume that fits the time budget, hence bounds k</td><td><code>rapidfuzz.process.cdist</code> (H1)</td></tr>
+      <tr><td>Non-deterministic training</td><td><code>params</code> without <code>seed</code></td><td>Last-decimal variation between runs; reproducibility claim weakened</td><td>Fix <code>seed</code>, <code>bagging_seed</code>, <code>feature_fraction_seed</code> (H1)</td></tr>
+    </tbody>
+  </table>
+
+  <h3>14.2.1 The blocking ceiling</h3>
+  <p>The matcher only sees pairs that <code>block()</code> produces, and the union of four views (core name k=25, name-plus-address k=25, address k=10, same-postal name k=10, each cut at cosine 0.05) is a finite budget. A true match outside all four lists is unrecoverable, and because the metric is macro-averaged per Source-1 entity the loss is concentrated: an entity whose single true match is missed scores exactly 0. For an entity with m true matches of which the blocker retrieves m−1 and the matcher accepts exactly those, precision is 1 and recall is (m−1)/m, so F<sub>0.5</sub> = 1.25·R/(0.25+R) gives 0.833 for m=2 and 0.909 for m=3. Records whose name and address are both heavily rewritten, or whose name is in a non-Latin script, are the most likely to fall outside every view; the log line "S1 entities with &gt;=1 true match blocked" measures this on the training split.</p>
+
+  <h3>14.2.2 Coverage of the normalisation tables</h3>
+  <p><code>NAME_ABBR</code> holds 18 entries and <code>ADDR_ABBR</code> 41, written from the problem statement's noise list, not learned from the data. Any abbreviation absent from the tables is left to the fuzzy features, which penalise <code>mfrs</code> against <code>manufacturers</code> as heavily as a typo. Several expansions are ambiguous and applied unconditionally: <code>st</code> becomes <code>street</code> even in <code>st louis</code>, <code>ste</code> is <code>suite</code> in addresses but <code>societe</code> in names, and in addresses the single letters <code>n</code>, <code>s</code>, <code>e</code>, <code>w</code> become compass points even when they are initials of a landmark or a person. Hindi-transliteration coverage is limited to <code>marg</code>, <code>salai</code>, <code>ngr</code>, <code>clny</code>, <code>sec</code>, <code>chowk</code> and <code>mg</code>; alternations such as <code>sri</code>/<code>shri</code> are handled only implicitly by n-gram overlap, and the French list covers legal forms and four street types. Because <code>basic()</code> encodes to ASCII with <code>errors="ignore"</code>, a string written entirely in Devanagari collapses to the empty string, its TF-IDF row in the name view is all zeros, and the record can be blocked only through the address view or the address half of the name-plus-address view; the same-postal view ranks by name cosine and therefore never returns it either.</p>
+
+  <h3>14.2.3 The unseen country and feature drift</h3>
+  <p>No French pair contributes to the LightGBM training set or to the <code>(thr, ratio)</code> sweep, so behaviour on France is an extrapolation. The design mitigates this (Chapters 5 to 7): normalisation is language-agnostic, the vectorisers are refitted on the test corpus inside <code>block()</code>, and the context features (<code>cos_full_gap1</code>, <code>rank1</code>, <code>n_cand1</code> and their <code>i2</code> counterparts) are relative rather than absolute. Those context features are also the second concern: computed by <code>groupby</code> over the candidate table, their distribution depends on how many candidates each record collects, hence on block size, view overlap and country. If French blocks differ in size from US and Indian ones, <code>n_cand1</code> and the gap features shift and tree splits may be systematically off. The only test-time signal is the per-country match rate that <code>main()</code> logs: a French rate far from the seen countries' is a warning, not a diagnosis.</p>
+
+  <h3>14.2.4 Decision-layer simplifications</h3>
+  <p>The decision rule (Chapter 9) is where precision is bought, and it is deliberately simple. One <code>thr</code> and one <code>ratio</code> serve all countries and both sources; if the OOF-optimal threshold for India differs from the US one, the global value under-matches one and over-matches the other, and France inherits a compromise it was never measured on. Second, <code>decode_table()</code> assigns each S2/S3 record to at most one S1, and <code>decide()</code> compares each pair with the best of its <code>(i1, is_s3)</code> group, but the S2 and S3 matches accepted for the same S1 are never compared with each other. An S1 entity may accept an S2 record at one address and an S3 record at another; whichever is wrong is a false positive. On a two-match entity that accepts one correct and one wrong record, P = R = 0.5 and the score falls from 1.0 to 0.5; on a one-match entity that accepts its true record plus a wrong one, P = 0.5, R = 1 and the score is 0.556.</p>
+
+  <h3>14.2.5 Throughput</h3>
+  <p><code>features()</code> evaluates about twenty rapidfuzz and Python-level expressions per pair inside list comprehensions, and the sweep calls <code>to_lists()</code> and <code>macro_f05()</code>, both Python loops, 6 × 31 = 186 times. Chapter 12 estimates the rapidfuzz loop as the third-largest block of wall-clock after retrieval and cross-validation, and the grid as minor; none of these has been timed on the real data. The effect on the score is indirect: the candidate budget k is chosen with this cost in mind, so a faster feature stage permits a larger k and a higher recall ceiling at the same wall-clock.</p>
+
+  <h2>14.3 Risk register</h2>
+  <p>Table 14.2 records the operational risks for the first real run and the submission, with qualitative likelihood and impact (Low, Medium, High) and the mitigation that exists in the code or is scheduled. Impact is judged on score or eligibility, not on engineering effort.</p>
+  <table class="tbl">
+    <caption>Table 14.2 — Risk register</caption>
+    <thead><tr><th>Id</th><th>Risk</th><th>Likelihood</th><th>Impact</th><th>Mitigation</th></tr></thead>
+    <tbody>
+      <tr><td>R1</td><td>First full run exceeds Kaggle memory or time</td><td>Medium</td><td>High (no submission)</td><td><code>topk_sparse()</code> chunks at <code>max_cells=2e7</code>; <code>pair_cos()</code> slices 200k pairs; reduce k as fallback</td></tr>
+      <tr><td>R2</td><td>Blocking recall ceiling below expectation (for example under 0.9)</td><td>Medium</td><td>High</td><td>Per-country and per-source recall logs isolate the weak view; raise k or add a view (H1, H2)</td></tr>
+      <tr><td>R3</td><td>France over- or under-matched because <code>(thr, ratio)</code> is calibrated on US and India</td><td>High</td><td>High</td><td>Per-country test match-rate log; pseudo-unseen-country validation (H1)</td></tr>
+      <tr><td>R4</td><td>Singletons over-predicted, each costing a full 1.0</td><td>Medium</td><td>High</td><td>Sweep maximises macro F<sub>0.5</sub> including singletons; <code>ratio</code> suppresses weak seconds</td></tr>
+      <tr><td>R5</td><td>Non-Latin-script names reduced to empty strings by <code>basic()</code></td><td>Low to Medium (data dependent)</td><td>High for affected entities</td><td>Add a count of empty <code>name_c</code> after <code>prep()</code>; address and name-plus-address views still apply; phonetic or encoder view (H1, H2)</td></tr>
+      <tr><td>R6</td><td>Vectorisers refitted on test shift cosine-feature scale</td><td>Medium</td><td>Medium</td><td>Context features are relative; monitor <code>cos_full</code> quantiles train vs test</td></tr>
+      <tr><td>R7</td><td>Result not bit-reproducible (no LightGBM <code>seed</code>)</td><td>High</td><td>Low</td><td>Fix seeds (H1); document tolerance</td></tr>
+      <tr><td>R8</td><td>Public/private leaderboard split variance</td><td>Medium</td><td>Medium</td><td>Select parameters on OOF, never on public score</td></tr>
+      <tr><td>R9</td><td><code>_postal</code> captures a 5- or 6-digit non-postal number</td><td>Low</td><td>Low</td><td><code>_addr_nums()</code> keeps the leading number; <code>postal_state</code> is ternary, so the model can discount it</td></tr>
+      <tr><td>R10</td><td>Feature stage too slow at real candidate volume</td><td>Medium</td><td>Medium</td><td><code>rapidfuzz.process.cdist</code> vectorisation (H1)</td></tr>
+      <tr><td>R11</td><td>Roadmap re-ranker violates licence or 8B limit, or loads weights via network</td><td>Low</td><td>High (disqualification)</td><td>Restrict to Table 14.3 families; attach weights offline; see Chapter 13</td></tr>
+    </tbody>
+  </table>
+
+  <h2>14.4 Roadmap</h2>
+  <p>The roadmap has three horizons ordered by effort and by confidence that the change improves macro F<sub>0.5</sub>. Every item has one acceptance rule: it is merged only if the OOF macro F<sub>0.5</sub> from the <code>GroupKFold</code> loop in <code>main()</code> does not fall, and preferred if the blocking recall ceiling rises. Figure 14.1 shows the sequencing; the horizons are cumulative.</p>
+  <figure>
+    <svg viewBox="0 0 800 330" width="100%" role="img" aria-label="Roadmap timeline in three horizons">
+      <defs>
+        <marker id="ch14-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="#334155"/>
+        </marker>
+      </defs>
+      <line x1="30" y1="34" x2="785" y2="34" stroke="#334155" stroke-width="2" marker-end="url(#ch14-arrow)"/>
+      <text x="30" y="22" font-family="inherit" font-size="13" fill="#0f172a">first real run</text>
+      <text x="785" y="22" text-anchor="end" font-family="inherit" font-size="13" fill="#0f172a">OOF-gated merges</text>
+
+      <rect x="30" y="50" width="235" height="34" rx="6" fill="#dbeafe" stroke="#334155"/>
+      <text x="147" y="72" text-anchor="middle" font-family="inherit" font-size="14" font-weight="bold" fill="#0f172a">H1  quick wins (days)</text>
+      <rect x="283" y="50" width="235" height="34" rx="6" fill="#dcfce7" stroke="#334155"/>
+      <text x="400" y="72" text-anchor="middle" font-family="inherit" font-size="14" font-weight="bold" fill="#0f172a">H2  learned models (weeks)</text>
+      <rect x="536" y="50" width="235" height="34" rx="6" fill="#fef3c7" stroke="#334155"/>
+      <text x="653" y="72" text-anchor="middle" font-family="inherit" font-size="14" font-weight="bold" fill="#0f172a">H3  research (open-ended)</text>
+
+      <line x1="265" y1="67" x2="283" y2="67" stroke="#334155" stroke-width="2" marker-end="url(#ch14-arrow)"/>
+      <line x1="518" y1="67" x2="536" y2="67" stroke="#334155" stroke-width="2" marker-end="url(#ch14-arrow)"/>
+
+      <rect x="30" y="98" width="235" height="30" rx="6" fill="#f1f5f9" stroke="#334155"/>
+      <text x="147" y="118" text-anchor="middle" font-family="inherit" font-size="13" fill="#0f172a">per-country (thr, ratio) sweep</text>
+      <rect x="30" y="136" width="235" height="30" rx="6" fill="#f1f5f9" stroke="#334155"/>
+      <text x="147" y="156" text-anchor="middle" font-family="inherit" font-size="13" fill="#0f172a">seed in params (reproducible)</text>
+      <rect x="30" y="174" width="235" height="30" rx="6" fill="#f1f5f9" stroke="#334155"/>
+      <text x="147" y="194" text-anchor="middle" font-family="inherit" font-size="13" fill="#0f172a">rapidfuzz cdist in features()</text>
+      <rect x="30" y="212" width="235" height="30" rx="6" fill="#f1f5f9" stroke="#334155"/>
+      <text x="147" y="232" text-anchor="middle" font-family="inherit" font-size="13" fill="#0f172a">phonetic keys as blocking view</text>
+      <rect x="30" y="250" width="235" height="30" rx="6" fill="#f1f5f9" stroke="#334155"/>
+      <text x="147" y="270" text-anchor="middle" font-family="inherit" font-size="13" fill="#0f172a">address-component parsing</text>
+
+      <rect x="283" y="98" width="235" height="30" rx="6" fill="#f1f5f9" stroke="#334155"/>
+      <text x="400" y="118" text-anchor="middle" font-family="inherit" font-size="13" fill="#0f172a">pseudo-unseen-country validation</text>
+      <rect x="283" y="136" width="235" height="30" rx="6" fill="#f1f5f9" stroke="#334155"/>
+      <text x="400" y="156" text-anchor="middle" font-family="inherit" font-size="13" fill="#0f172a">OOF-hard pair mining</text>
+      <rect x="283" y="174" width="235" height="30" rx="6" fill="#f1f5f9" stroke="#334155"/>
+      <text x="400" y="194" text-anchor="middle" font-family="inherit" font-size="13" fill="#0f172a">cross-encoder re-ranker</text>
+      <rect x="283" y="212" width="235" height="30" rx="6" fill="#f1f5f9" stroke="#334155"/>
+      <text x="400" y="232" text-anchor="middle" font-family="inherit" font-size="13" fill="#0f172a">embedding view #5 in block()</text>
+
+      <rect x="536" y="98" width="235" height="30" rx="6" fill="#f1f5f9" stroke="#334155"/>
+      <text x="653" y="118" text-anchor="middle" font-family="inherit" font-size="13" fill="#0f172a">graph / transitive decoding</text>
+      <rect x="536" y="136" width="235" height="30" rx="6" fill="#f1f5f9" stroke="#334155"/>
+      <text x="653" y="156" text-anchor="middle" font-family="inherit" font-size="13" fill="#0f172a">active learning near thr</text>
+      <rect x="536" y="174" width="235" height="30" rx="6" fill="#f1f5f9" stroke="#334155"/>
+      <text x="653" y="194" text-anchor="middle" font-family="inherit" font-size="13" fill="#0f172a">country-adaptive normalisation</text>
+
+      <rect x="30" y="296" width="741" height="26" rx="6" fill="#fee2e2" stroke="#334155"/>
+      <text x="400" y="314" text-anchor="middle" font-family="inherit" font-size="13" fill="#0f172a">gate for every item: OOF macro F0.5 (incl. singletons) must not fall; recall ceiling should rise</text>
+    </svg>
+    <figcaption>Figure 14.1 — Roadmap timeline: three cumulative horizons, each item gated on the OOF macro F<sub>0.5</sub> reported by <code>main()</code>.</figcaption>
+  </figure>
+
+  <h3>14.4.1 Horizon 1: quick wins</h3>
+  <p>These changes touch a few lines each and carry no licence or resource risk.</p>
+  <ul>
+    <li><strong>Per-country and per-source <code>(thr, ratio)</code>.</strong> The sweep in <code>main()</code> is repeated with <code>macro_f05()</code> restricted to one country's S1 entities. France, having no labels, receives the higher of the two thresholds, because a false positive on a singleton costs 1.0 whereas a missed match costs a fraction.</li>
+    <li><strong>Seed fixing.</strong> Adding <code>seed</code>, <code>bagging_seed</code> and <code>feature_fraction_seed</code> to <code>params</code> makes the fold models and the refit deterministic, so the reproducibility claim of Chapter 11 becomes exact.</li>
+    <li><strong>Vectorised string features.</strong> Replacing the list comprehensions in <code>features()</code> with <code>rapidfuzz.process.cdist</code> on aligned arrays removes the per-pair Python overhead; the freed budget goes to a larger <code>k_addr</code> or <code>k_postal</code>, the two views with the smallest k (10 each).</li>
+    <li><strong>Phonetic keys.</strong> A fifth blocking key from a phonetic encoding of core-name tokens (Double Metaphone or an in-repo consonant-skeleton code, no external data) groups <code>vishwakarma</code> with <code>bishwakarma</code> and <code>sri</code> with <code>shri</code>; it joins the union in <code>block()</code> like the same-postal view.</li>
+    <li><strong>Address-component parsing.</strong> A regex split of <code>addr_n</code> into house number, street, locality, city and postal code enables component-wise features, notably a street-name ratio not diluted by landmarks such as <code>near sbi atm</code>.</li>
+  </ul>
+
+  <h3>14.4.2 Horizon 2: learned components</h3>
+  <p>Horizon 2 replaces the two hand-built parts that limit generalisation, the abbreviation tables and the n-gram representation, with learned models, subject to the licence and size rules of Chapter 13.</p>
+  <p><strong>Pairwise cross-encoder re-ranker.</strong> A cross-encoder takes the concatenation <code>name_n | addr_n [SEP] name_n | addr_n</code> of a pair and outputs one match probability, attending across both records, which suits abbreviation, transliteration and word-order noise. It is trained on the OOF-hard pairs (those with <code>oof</code> probability in an illustrative band of roughly 0.2 to 0.8, to be set from the run) plus all positives, so it learns the cases the feature model cannot separate. Its output becomes one more LightGBM feature or, more conservatively, a second-stage re-ranker applied only to pairs within a margin of <code>thr</code>, leaving confident decisions and singletons untouched. Table 14.3 lists candidate backbones, all far below 8 billion parameters; weights must be attached to the Kaggle environment offline.</p>
+  <table class="tbl">
+    <caption>Table 14.3 — Candidate backbones for the pairwise re-ranker and the embedding view</caption>
+    <thead><tr><th>Model family</th><th>Approx. parameters</th><th>Licence</th><th>Multilingual</th><th>Role</th></tr></thead>
+    <tbody>
+      <tr><td>multilingual-e5-small / base / large</td><td>118M / 278M / 560M</td><td>MIT</td><td>Yes (100+ languages)</td><td>Embedding view; fine-tune as bi- or cross-encoder</td></tr>
+      <tr><td>paraphrase-multilingual-MiniLM-L12-v2</td><td>118M</td><td>Apache-2.0</td><td>Yes (50+ languages)</td><td>Embedding view (fastest option)</td></tr>
+      <tr><td>xlm-roberta-base / large</td><td>278M / 560M</td><td>MIT</td><td>Yes (100 languages incl. Hindi, French)</td><td>Cross-encoder backbone</td></tr>
+      <tr><td>mdeberta-v3-base</td><td>about 280M</td><td>MIT</td><td>Yes</td><td>Cross-encoder backbone (strong pair classification)</td></tr>
+      <tr><td>bert-base-multilingual-cased</td><td>178M</td><td>Apache-2.0</td><td>Yes (104 languages)</td><td>Cross-encoder backbone</td></tr>
+      <tr><td>distilbert-base-multilingual-cased</td><td>134M</td><td>Apache-2.0</td><td>Yes</td><td>Cross-encoder backbone (CPU-friendly)</td></tr>
+      <tr><td>bge-m3</td><td>568M</td><td>MIT</td><td>Yes</td><td>Embedding view</td></tr>
+      <tr><td>LaBSE</td><td>471M</td><td>Apache-2.0</td><td>Yes (109 languages)</td><td>Embedding view; robust to transliteration</td></tr>
+      <tr><td>gte-multilingual-base</td><td>305M</td><td>Apache-2.0 (verify licence for the exact checkpoint)</td><td>Yes</td><td>Embedding view</td></tr>
+      <tr><td>Qwen2.5-0.5B / 1.5B / 7B</td><td>0.5B / 1.5B / 7B</td><td>Apache-2.0 (verify licence per size; the 3B checkpoint is not Apache-2.0)</td><td>Yes</td><td>Decoder scored as pair classifier; only if encoders prove insufficient</td></tr>
+    </tbody>
+  </table>
+  <p><strong>Embedding-based blocking view.</strong> A multilingual sentence embedding of <code>name_c + " | " + addr_c</code>, from any bi-encoder in Table 14.3, indexed by exact inner product per country block, provides a fifth top-k view whose similarity is semantic rather than orthographic, retrieving pairs that share few character n-grams. Its cosine joins <code>cos_name</code>, <code>cos_full</code> and <code>cos_addr</code> as a feature; the union logic of <code>block()</code> is unchanged.</p>
+  <p><strong>Pseudo-unseen-country validation.</strong> The OOF loop is run with the US as training country and India as held-out validation, and vice versa; the gap between in-country and cross-country OOF macro F<sub>0.5</sub> is the expected penalty for France and sets the threshold margin chosen in horizon 1.</p>
+
+  <h3>14.4.3 Horizon 3: research directions</h3>
+  <ul>
+    <li><strong>Graph and transitive decoding.</strong> Score S2–S3 pairs with the same feature set, build the graph of accepted and candidate edges, and decode per connected component so that an S1 entity's accepted S2 and S3 records are consistent with each other. This removes the contradiction of Section 14.2.4; the solver rejects, never adds, when evidence conflicts, so the step stays precision-first.</li>
+    <li><strong>Active learning on uncertain pairs.</strong> Pairs with OOF probability near <code>thr</code> carry the most information; reweighting them, or training the re-ranker on them first, spends capacity where the F<sub>0.5</sub> decision is made.</li>
+    <li><strong>Country-adaptive normalisation.</strong> Learn abbreviation expansions from the training pairs by aligning tokens between matched names and addresses, and apply per-country tables in <code>norm_name()</code> and <code>norm_addr()</code>; a new country is covered by unsupervised alignment among its own candidate pairs.</li>
+  </ul>
+
+  <aside class="note"><strong>Design note.</strong> The order of the horizons follows the metric. Horizon 1 raises precision where it is cheapest (per-country thresholds, a singleton-safe France margin) and recall where it is safest (a larger candidate budget behind an unchanged matcher). Horizon 2 attacks residual errors no string feature can express. Horizon 3 changes the decision structure itself, the step with the highest potential and the highest risk of new false positives, so it comes last.</aside>
+</section>

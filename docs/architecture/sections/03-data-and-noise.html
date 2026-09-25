@@ -1,0 +1,161 @@
+<section class="chapter" id="ch-03">
+  <h1><span class="num">3</span> Data Understanding and Noise Taxonomy</h1>
+  <p class="lead">This chapter describes the input data as the pipeline sees it: three tab-separated sources whose records share no key, an <code>entity_id</code> prefix that is the only source indicator, and free-text names and addresses in which the same business is spelled, abbreviated, truncated and reordered differently in every source. The noise patterns of the problem statement are expanded into a systematic taxonomy that pairs each pattern with the mechanism in <code>er_pipeline.py</code> that absorbs it. The chapter also sets out the address anatomy of the three countries, the open-set country rule, and the profiling output that must be inspected before any modelling decision is trusted.</p>
+
+  <h2>3.1 Sources and What Each Contributes</h2>
+  <h3>3.1.1 The three sources</h3>
+  <p>Every split (train and test) consists of three files, <code>*_source1.tsv</code>, <code>*_source2.tsv</code> and <code>*_source3.tsv</code>, with identical columns: <code>entity_id</code>, <code>business_name</code>, <code>business_address</code> and <code>country</code>. The problem statement designates Source 1 (S1) as the <em>deduplicated reference source</em>: each S1 record stands for exactly one real-world business, and no two S1 records stand for the same business. Sources 2 and 3 (S2, S3) are independent feeds carrying partial, noisy fragments of the same businesses; the task is to attach each S2/S3 record to the S1 entity it describes, or to leave an S1 entity as a singleton when neither feed mentions it. Because S1 is deduplicated, an S2/S3 record can belong to at most one S1 entity, a fact the decision layer exploits (see Chapter 9), whereas an S1 entity can own zero, one or many S2/S3 records.</p>
+  <p>The training split adds <code>train_ground_truth.tsv</code>, which maps each S1 <code>source1_entity_id</code> to a comma-separated <code>matched_entity_ids</code> list that is empty for singletons. <code>load_split()</code> parses it into a dictionary from S1 id to a <em>set</em> of matched ids; the empty string yields an empty set, so singletons are represented explicitly. The same function concatenates S2 and S3 into a single frame, because blocking and matching treat the two feeds as one candidate pool and recover the source distinction from the id prefix.</p>
+  <h3>3.1.2 entity_id prefix semantics</h3>
+  <p>There is no source column. A record's origin is encoded in the first two characters of its <code>entity_id</code>: <code>S1-</code>, <code>S2-</code> or <code>S3-</code>. <code>prep()</code> materialises this as the <code>src</code> column (<code>entity_id.str[:2]</code>), from which <code>features()</code> derives the binary feature <code>is_s3</code> and <code>decode_table()</code> forms its per-<code>(S1, source)</code> groups. The prefix also carries two hard output constraints of Chapter 2: a matched id must begin with <code>S2-</code> or <code>S3-</code> and must exist in the test set. Because the pipeline only emits ids read from the test S2/S3 files, both hold by construction (see Chapter 11).</p>
+  <h3>3.1.3 Loading discipline</h3>
+  <p>The files are tab-separated because addresses and id lists contain commas. <code>read_tsv()</code> reads with <code>sep="\t"</code>, <code>dtype=str</code> (postal codes must keep leading zeros), <code>keep_default_na=False</code> (an empty address is an empty string, not <code>NaN</code>) and <code>quoting=3</code> (<code>csv.QUOTE_NONE</code>, so a stray double quote inside a name does not swallow the rest of the line). Reading without these settings corrupts the data silently.</p>
+
+  <h2>3.2 One Entity, Three Records</h2>
+  <p>Figure 3.1 traces one fictitious but representative Indian business through the three sources and through <code>prep()</code>. Each record carries a different subset of the noise patterns of Section 3.3; the right-hand column shows the fields the pipeline compares. After normalisation all three records share the same core name, while their addresses still differ in coverage: S2 lacks the PIN code, S3 lacks the street and house number. No single field is reliable on its own, which is why blocking uses three views (see Chapter 6) and why the address features encode "unknown" as a distinct state rather than as disagreement (see Chapter 7).</p>
+  <figure>
+    <svg viewBox="0 0 800 470" width="100%" font-family="inherit" font-size="13" fill="#0f172a">
+      <defs>
+        <marker id="ch03-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="#334155"/>
+        </marker>
+      </defs>
+      <!-- real-world entity -->
+      <rect x="10" y="170" width="170" height="120" rx="6" fill="#dbeafe" stroke="#334155"/>
+      <text x="95" y="192" text-anchor="middle" font-weight="bold">Real-world entity</text>
+      <text x="20" y="214">Sharma Brothers</text>
+      <text x="20" y="232">Private Limited</text>
+      <text x="20" y="254">12/3 MG Road,</text>
+      <text x="20" y="272">Indiranagar, 560038</text>
+      <!-- fan-out arrows -->
+      <line x1="180" y1="210" x2="230" y2="60" stroke="#334155" stroke-width="1.5" marker-end="url(#ch03-arrow)"/>
+      <line x1="180" y1="230" x2="230" y2="230" stroke="#334155" stroke-width="1.5" marker-end="url(#ch03-arrow)"/>
+      <line x1="180" y1="250" x2="230" y2="400" stroke="#334155" stroke-width="1.5" marker-end="url(#ch03-arrow)"/>
+      <!-- S1 record -->
+      <rect x="232" y="10" width="300" height="118" rx="6" fill="#f1f5f9" stroke="#334155"/>
+      <text x="242" y="30" font-weight="bold">S1-00417 (reference)</text>
+      <text x="242" y="50">Sharma Bros. Pvt. Ltd.</text>
+      <text x="242" y="68">12/3, M.G. Road, Indiranagar,</text>
+      <text x="242" y="86">Bengaluru 560038</text>
+      <text x="242" y="108">noise: abbreviations, dotted acronym, slash</text>
+      <!-- S2 record -->
+      <rect x="232" y="176" width="300" height="118" rx="6" fill="#fef3c7" stroke="#334155"/>
+      <text x="242" y="196" font-weight="bold">S2-08812</text>
+      <text x="242" y="216">SHARMA BROTHERS PRIVATE LIMITED</text>
+      <text x="242" y="234">No. 12/3 MG Rd, Near SBI ATM,</text>
+      <text x="242" y="252">Indira Nagar, Bangalore</text>
+      <text x="242" y="274">noise: casing, landmark, no PIN, spelling</text>
+      <!-- S3 record -->
+      <rect x="232" y="342" width="300" height="118" rx="6" fill="#fee2e2" stroke="#334155"/>
+      <text x="242" y="362" font-weight="bold">S3-02291</text>
+      <text x="242" y="382">Sharma Bros &amp; Co</text>
+      <text x="242" y="400">Indiranagar, Bengaluru,</text>
+      <text x="242" y="418">Karnataka 560038</text>
+      <text x="242" y="440">noise: ampersand, suffix swap, no street</text>
+      <!-- prep arrows -->
+      <line x1="532" y1="69" x2="572" y2="69" stroke="#334155" stroke-width="1.5" marker-end="url(#ch03-arrow)"/>
+      <line x1="532" y1="235" x2="572" y2="235" stroke="#334155" stroke-width="1.5" marker-end="url(#ch03-arrow)"/>
+      <line x1="532" y1="401" x2="572" y2="401" stroke="#334155" stroke-width="1.5" marker-end="url(#ch03-arrow)"/>
+      <text x="552" y="60" text-anchor="middle" font-size="13">prep()</text>
+      <!-- normalised S1 -->
+      <rect x="574" y="10" width="216" height="118" rx="6" fill="#dcfce7" stroke="#334155"/>
+      <text x="584" y="30" font-weight="bold">name_c / addr_c / postal</text>
+      <text x="584" y="50">sharma brothers</text>
+      <text x="584" y="68">12 3 mahatma gandhi road</text>
+      <text x="584" y="86">indiranagar bengaluru 560038</text>
+      <text x="584" y="108">postal 560038, house 12</text>
+      <!-- normalised S2 -->
+      <rect x="574" y="176" width="216" height="118" rx="6" fill="#dcfce7" stroke="#334155"/>
+      <text x="584" y="196" font-weight="bold">name_c / addr_c / postal</text>
+      <text x="584" y="216">sharma brothers</text>
+      <text x="584" y="234">12 3 mahatma gandhi road</text>
+      <text x="584" y="252">sbi atm indira nagar bangalore</text>
+      <text x="584" y="274">postal (none), house 12</text>
+      <!-- normalised S3 -->
+      <rect x="574" y="342" width="216" height="118" rx="6" fill="#dcfce7" stroke="#334155"/>
+      <text x="584" y="362" font-weight="bold">name_c / addr_c / postal</text>
+      <text x="584" y="382">sharma brothers</text>
+      <text x="584" y="400">indiranagar bengaluru</text>
+      <text x="584" y="418">karnataka 560038</text>
+      <text x="584" y="440">postal 560038, house (none)</text>
+    </svg>
+    <figcaption>Figure 3.1 — One real-world entity fanning out into S1, S2 and S3 records, with the noise carried by each record and the fields produced by <code>prep()</code>. All three records converge on the core name <code>sharma brothers</code>; the addresses converge only partially, and the missing PIN (S2) and missing house number (S3) become explicit "unknown" states.</figcaption>
+  </figure>
+
+  <h2>3.3 Noise Taxonomy</h2>
+  <p>The problem statement lists the noise families informally. Table 3.1 restates them as an engineering taxonomy: each row names a pattern, gives a pair of surface forms that must be recognised as the same business, and identifies the mechanism that makes the pair comparable. Three layers recur. <em>Normalisation</em> (Chapter 5) rewrites both strings so that the difference disappears before comparison; it is the cheapest and most precise layer, but covers only what <code>NAME_ABBR</code>, <code>LEGAL</code>, <code>ADDR_ABBR</code> and <code>ADDR_STOP</code> enumerate. <em>Representation</em> (Chapter 6) uses character 2-4-grams inside word boundaries (<code>analyzer="char_wb"</code>), which degrade gracefully under typos and reordering that no table anticipates. <em>Features</em> (Chapter 7) expose the residual difference to the classifier as a number, so that the model rather than a rule decides how much a given disagreement should cost. The precision-weighted metric favours this layering: normalisation removes noise without manufacturing agreement, while the feature layer lets the model refuse a pair whenever evidence conflicts.</p>
+  <table class="tbl">
+    <caption>Table 3.1 — Noise taxonomy: pattern, example pair and absorbing mechanism. N = name field, A = address field.</caption>
+    <thead>
+      <tr><th>#</th><th>Field</th><th>Noise pattern</th><th>Example pair</th><th>Absorbing mechanism</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>1</td><td>N</td><td>Legal-form abbreviation</td><td><code>Acme Corp</code> / <code>Acme Corporation</code>; <code>Pvt Ltd</code> / <code>Private Limited</code></td><td><code>NAME_ABBR</code> expansion in <code>norm_name()</code>, then removal of the expanded token by <code>core_name()</code> via <code>LEGAL</code></td></tr>
+      <tr><td>2</td><td>N</td><td>Legal suffix inconsistency or omission</td><td><code>Acme Inc</code> / <code>Acme, Incorporated</code> / <code>Acme</code></td><td><code>core_name()</code> strips every <code>LEGAL</code> token (falls back to the full name when nothing remains); <code>n_full_ratio</code> still compares the suffixed forms so the model can weigh a suffix clash</td></tr>
+      <tr><td>3</td><td>N</td><td>DBA / trade name inside one field</td><td><code>Acme Holdings LLC dba Acme Pizza</code> / <code>Acme Pizza</code></td><td><code>_ALIAS</code> split on the raw string (<code>dba</code>, <code>d/b/a</code>, <code>t/a</code>, <code>a.k.a.</code>, <code>formerly known as</code>); <code>name_parts()</code> yields variants; <code>n_alias_best</code>, <code>has_alias</code></td></tr>
+      <tr><td>4</td><td>N</td><td>Punctuation and symbol variants</td><td><code>A&amp;B Traders</code> / <code>A and B Traders</code>; <code>Cafe@Home</code></td><td><code>basic()</code> maps <code>&amp;</code> to <code>and</code>, <code>@</code> to <code>at</code>, and replaces every non <code>[a-z0-9 ]</code> character with a space</td></tr>
+      <tr><td>5</td><td>N</td><td>Dotted acronyms</td><td><code>P.V.T. Ltd</code> / <code>Pvt Ltd</code>; <code>U.S.A.</code> / <code>USA</code></td><td><code>_dotted</code> regex collapses runs of single letter plus dot before punctuation stripping, so the acronym survives as one token</td></tr>
+      <tr><td>6</td><td>N</td><td>Word-order transposition</td><td><code>Traders Sharma</code> / <code>Sharma Traders</code></td><td>order-free <code>n_tsort</code> (token sort) and <code>n_tset</code> (token set) ratios; <code>n_jacc</code>; char n-gram cosine is order-insensitive</td></tr>
+      <tr><td>7</td><td>N</td><td>Typos and dropped letters</td><td><code>Shrama Brothers</code> / <code>Sharma Brothers</code></td><td>char 2-4-gram TF-IDF cosine in blocking; <code>n_ratio</code> (Indel), <code>n_jw</code> (Jaro-Winkler) as features</td></tr>
+      <tr><td>8</td><td>N</td><td>Casing</td><td><code>SHARMA BROTHERS</code> / <code>Sharma Brothers</code></td><td><code>basic()</code> lowercases after NFKD folding</td></tr>
+      <tr><td>9</td><td>N</td><td>Diacritics and transliteration</td><td><code>Société Générale</code> / <code>Societe Generale</code>; <code>Lakshmi</code> / <code>Laxmi</code></td><td>NFKD decomposition and ASCII filter in <code>basic()</code> handle accents exactly; phonetic respellings are only partially absorbed by char n-grams and <code>n_jw</code></td></tr>
+      <tr><td>10</td><td>N</td><td>Acronym versus expansion</td><td><code>SBI</code> / <code>State Bank of India</code></td><td><code>n_acronym</code> (single token equal to the initials of the other core name; <code>of</code> already removed by <code>core_name()</code>); <code>n_init_eq</code></td></tr>
+      <tr><td>11</td><td>N</td><td>Extra or missing descriptive tokens</td><td><code>Acme Pizza</code> / <code>Acme Pizza and Grill</code></td><td><code>n_tset</code> and <code>n_partial</code> score the shared part at 100; <code>len_l</code>, <code>len_r</code> let the model discount short strings</td></tr>
+      <tr><td>12</td><td>A</td><td>Street-type abbreviation</td><td><code>12 Main St</code> / <code>12 Main Street</code>; <code>Bd</code> / <code>Boulevard</code></td><td><code>ADDR_ABBR</code> expansion in <code>norm_addr()</code> (<code>rd</code>, <code>st</code>, <code>ave</code>, <code>blvd</code>, <code>bd</code>, <code>dr</code>, <code>ln</code>, <code>hwy</code>, <code>pkwy</code>, <code>ct</code>, <code>pl</code>, <code>sq</code>)</td></tr>
+      <tr><td>13</td><td>A</td><td>Directional and unit abbreviations</td><td><code>100 N Main St Ste 4</code> / <code>100 North Main Street Suite 4</code></td><td><code>ADDR_ABBR</code> (<code>n s e w ne nw se sw</code>, <code>ste</code>, <code>apt</code>, <code>fl</code>, <code>flr</code>, <code>bldg</code>)</td></tr>
+      <tr><td>14</td><td>A</td><td>Missing components (no PIN, no state, no street)</td><td><code>Indiranagar, Bengaluru 560038</code> / <code>12/3 MG Road, Indiranagar</code></td><td>ternary states <code>postal_state</code> and <code>house_state</code> (0 = unknown, never -1); <code>num_overlap</code> = -1 when either side has no digits; <code>a_partial</code> scores the shared substring</td></tr>
+      <tr><td>15</td><td>A</td><td>Landmark-based references</td><td><code>Near SBI ATM, MG Road</code> / <code>MG Road</code></td><td><code>ADDR_STOP</code> removes <code>near</code>, <code>opposite</code>, <code>behind</code>, <code>beside</code>, <code>next</code>, <code>to</code> (as separate tokens) in <code>addr_c</code>; residual landmark tokens are tolerated by <code>a_tset</code>; <code>nr</code>/<code>opp</code> expanded first by <code>ADDR_ABBR</code></td></tr>
+      <tr><td>16</td><td>A</td><td>Municipal numbering formats</td><td><code>No. 12/3</code> / <code>12-3</code> / <code>Plot 12, Door 3</code></td><td><code>basic()</code> turns <code>/</code> and <code>-</code> into spaces; <code>_digits</code> extracts the run set {12, 3} in <code>_addr_nums()</code>; <code>no</code>/<code>number</code> are <code>ADDR_STOP</code> words; <code>num_overlap</code>, <code>num_conflict</code>, <code>house_state</code></td></tr>
+      <tr><td>17</td><td>A</td><td>Component reordering</td><td><code>Bengaluru, Indiranagar, MG Road</code> / <code>MG Road, Indiranagar, Bengaluru</code></td><td><code>a_tset</code>, <code>a_jacc</code>; the <code>addr</code> and <code>full</code> blocking views are bag-of-n-gram and therefore order-free</td></tr>
+      <tr><td>18</td><td>A</td><td>Transliteration and idiom variants</td><td><code>Indira Ngr</code> / <code>Indiranagar</code>; <code>Anna Salai</code> / <code>Anna Road</code>; <code>Gandhi Marg</code></td><td><code>ADDR_ABBR</code> maps <code>ngr</code> to <code>nagar</code>, <code>marg</code> and <code>salai</code> to <code>road</code>, <code>mg</code> to <code>mahatma gandhi</code>, <code>clny</code>, <code>sec</code>, <code>mkt</code>, <code>stn</code>; the spacing variant <code>indira nagar</code> / <code>indiranagar</code> is left to char n-grams</td></tr>
+      <tr><td>19</td><td>A</td><td>ZIP+4 versus ZIP; PIN written with an internal space</td><td><code>Austin TX 78701-2345</code> / <code>Austin TX 78701</code>; <code>560 038</code> / <code>560038</code></td><td><code>_postal</code> = <code>\b(\d{5,6})(?:-\d{4})?\b</code> captures only the 5- or 6-digit stem, so ZIP+4 is absorbed; the last match on the raw address wins. A spaced PIN (<code>560 038</code>) is <em>not</em> matched: <code>postal</code> is empty and <code>postal_state</code> falls to 0 (unknown), which is the safe direction under F<sub>0.5</sub></td></tr>
+      <tr><td>20</td><td>A</td><td>French articles and street types</td><td><code>12 Av. de la Paix</code> / <code>12 Avenue de la Paix</code>; <code>Bd Haussmann</code> / <code>Boulevard Haussmann</code>; <code>Fbg Saint-Honoré</code></td><td><code>ADDR_STOP</code> removes <code>de la le du des</code>; <code>ADDR_ABBR</code> expands <code>av</code>, <code>bd</code>, <code>fbg</code>, <code>chem</code>, <code>imp</code>; accents folded by NFKD. A bare <code>r.</code> for <code>rue</code> is not in the table and stays as the token <code>r</code></td></tr>
+      <tr><td>21</td><td>N/A</td><td>Same business, no common tokens at all</td><td>trade name on one side, legal name on the other, addresses in different scripts</td><td>Not absorbed by any rule; recovered only if the same-postal blocking view finds the pair and the model trusts address evidence. Counted in the blocking recall ceiling (Chapter 6)</td></tr>
+    </tbody>
+  </table>
+  <aside class="note"><strong>Design note.</strong> The same token can require different expansions in the two fields. <code>ste</code> is <code>societe</code> in <code>NAME_ABBR</code> (an accent-stripped <code>Sté</code>) but <code>suite</code> in <code>ADDR_ABBR</code>; <code>st</code> is expanded to <code>street</code> only in addresses, so a name such as <code>St Mary Hospital</code> is not rewritten. Keeping two tables rather than one is what makes the expansions safe, and safety matters more than coverage under F<sub>0.5</sub>: a wrong expansion that manufactures agreement is a false-merge generator.</aside>
+
+  <h2>3.4 Country-Specific Address Anatomy</h2>
+  <p>The three countries differ in both component order and numbering conventions. The pipeline does not parse addresses into components; it relies on a few country-agnostic extractions (postal code, digit runs, leading number) and on token-level normalisation. Table 3.2 records the canonical address of each country, the components the data is expected to drop or reorder, and how each extraction behaves on that anatomy.</p>
+  <table class="tbl">
+    <caption>Table 3.2 — Address anatomy by country and the behaviour of the pipeline's address extractions on each.</caption>
+    <thead>
+      <tr><th>Aspect</th><th>United States</th><th>India</th><th>France (test only)</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Canonical order</td><td>number, street name, street type, [unit], city, state, ZIP</td><td>[plot/door/shop number], [building], street or landmark, area (nagar, colony, sector), city, [district], state, PIN</td><td>numéro, type de voie, nom de voie, [complément], code postal, commune</td></tr>
+      <tr><td>Building numbering</td><td>Single integer, occasionally with a unit (<code>Ste 200</code>, <code>Apt 4B</code>); 5-digit house numbers exist</td><td>Compound forms with slashes or hyphens (<code>12/3</code>, <code>4-1-23</code>), <code>Plot No.</code>, <code>Door No.</code>, <code>Shop No.</code>, floor prefixes (<code>1st Floor</code>)</td><td>Single integer, often with <code>bis</code>/<code>ter</code> suffix (<code>12 bis</code>)</td></tr>
+      <tr><td>Postal code</td><td>5-digit ZIP, optional <code>-NNNN</code> (ZIP+4); <code>_postal</code> keeps the 5-digit stem</td><td>6-digit PIN, sometimes written with a space (<code>560 038</code>), which <code>_postal</code> does not match; frequently missing</td><td>5-digit code postal whose first two digits are the département; matched by the same <code>\d{5,6}</code> pattern</td></tr>
+      <tr><td>Region unit</td><td>Two-letter state (<code>TX</code>) or full name; not expanded by the pipeline, except that <code>CT</code>, <code>FL</code> and <code>NE</code> collide with <code>ADDR_ABBR</code> and become <code>court</code>, <code>floor</code>, <code>northeast</code></td><td>State name, often omitted; city spelling variants (<code>Bangalore</code>/<code>Bengaluru</code>, <code>Bombay</code>/<code>Mumbai</code>) are not mapped</td><td>Commune name; region rarely present; <code>Cedex</code> suffix possible</td></tr>
+      <tr><td>Characteristic idioms</td><td><code>N</code>/<code>S</code>/<code>E</code>/<code>W</code>, <code>Hwy</code>, <code>Pkwy</code>, <code>Blvd</code>, <code>Ste</code></td><td><code>Nr</code>, <code>Opp</code>, <code>Behind</code>, <code>MG Rd</code>, <code>Ngr</code>, <code>Clny</code>, <code>Sec</code>, <code>Mkt</code>, <code>Chowk</code>, <code>Marg</code>, <code>Salai</code></td><td><code>rue</code>, <code>av</code>, <code>bd</code>, <code>fbg</code>, <code>chem</code>, <code>imp</code>, articles <code>de la le du des</code>, accents</td></tr>
+      <tr><td>Legal forms in names</td><td><code>Inc</code>, <code>LLC</code>, <code>LLP</code>, <code>LP</code>, <code>Corp</code>, <code>Co</code>, <code>PLLC</code>, <code>DBA</code></td><td><code>Pvt Ltd</code>, <code>Private Limited</code>, <code>LLP</code>, <code>OPC</code>, <code>&amp; Co</code> (all stripped by <code>LEGAL</code>); <code>Bros</code> is expanded to <code>brothers</code> by <code>NAME_ABBR</code> but kept, since it is part of the trading name</td><td><code>SARL</code>, <code>SAS</code>, <code>SASU</code>, <code>SA</code>, <code>EURL</code>, <code>SCI</code>, <code>SNC</code>, <code>Société</code>, <code>Cie</code>, <code>et</code></td></tr>
+      <tr><td><code>house</code> extraction</td><td>Leading digit run = house number; reliable</td><td>Leading digit run = first part of the plot number, or a floor number when the floor is written first; moderately reliable</td><td>Leading digit run = numéro; <code>bis</code> is lost, which is harmless</td></tr>
+      <tr><td><code>nums</code> extraction</td><td>{house, unit numbers}; ZIP removed</td><td>{plot parts, door, floor, shop}; PIN removed unless it is the leading digit run and the address does not end with it</td><td>{numéro}; code postal removed</td></tr>
+    </tbody>
+  </table>
+  <p>Two details of <code>_addr_nums()</code> follow from this anatomy. First, the postal code is removed from the digit-run set so that two US records in the same ZIP do not appear to share a street number; <code>num_overlap</code> and <code>num_conflict</code> would otherwise be polluted by the most widely shared number in the data. Second, the removal is suppressed when the postal match is the leading number and does not end the string, because a 5-digit US house number with the ZIP omitted also matches <code>_postal</code> and must remain available as the house number. Both rules are precision measures: a spurious numeric agreement is exactly the evidence that pushes a non-match over the threshold.</p>
+  <p>A related consequence of token-level expansion is that <code>expand()</code> has no notion of position. The US state codes <code>CT</code>, <code>FL</code> and <code>NE</code> are rewritten by <code>ADDR_ABBR</code> to <code>court</code>, <code>floor</code> and <code>northeast</code> wherever they occur, and an Indian <code>Sec 5</code> becomes <code>sector 5</code> even when it abbreviates something else. These rewrites are consistent: both records of a true pair receive the same expansion, so pair similarity is unaffected, and a token shared by every record in a state carries little TF-IDF weight. The cost is confined to the rare non-pair in which an expansion manufactures a shared token.</p>
+  <p>The Indian anatomy is the hardest. The same building can be written <code>12/3</code>, <code>No. 12/3</code>, <code>12-3</code> or <code>Door 3, Plot 12</code>; after <code>basic()</code> all four yield the digit set {12, 3}, but only the first three yield <code>house = 12</code>, so <code>house_state</code> can report a false disagreement while <code>num_overlap</code> reports full agreement. The classifier sees both signals and learns which to trust (see Chapter 8). City-name transliterations (<code>Bangalore</code> versus <code>Bengaluru</code>) are deliberately not mapped: a gazetteer would be an external resource, and the same-postal blocking view already places both spellings in one block whenever the PIN is present.</p>
+
+  <h2>3.5 The Open-Set Country Requirement</h2>
+  <p>The training data cover <code>US</code> and <code>India</code>; the test data additionally contain <code>France</code>, which appears in no training record. The statement forbids hard-coding, filtering or one-hot-encoding the country to the training set, and requires every test S1 entity, French ones included, to appear in the output. The pipeline complies in three ways. The <code>country</code> value is never a feature: <code>features()</code> derives no column from it, so the model cannot learn a rule that France violates. The value is used only as a partition key in <code>block()</code>, where <code>country_n = basic(country)</code> is compared as a plain string; any label, including an unseen or blank one, forms its own group. Finally, when an S1 group's label does not occur among the S2/S3 records, <code>block()</code> compares that group against every S2/S3 record instead of an empty block, so a spelling variant such as <code>USA</code> against <code>US</code>, or a missing label, degrades to slower blocking rather than to a silently dropped entity.</p>
+  <aside class="warn"><strong>Risk: unseen-country drift.</strong> Compliance with the rule does not remove the statistical problem. The classifier and the decision parameters <code>(thr, ratio)</code> are fitted on US and Indian pairs only (see Chapters 8 and 9). French names carry longer legal forms and articles, French addresses put the postal code before the commune, and the TF-IDF vocabulary for French text is learned only at test time when the vectorisers are refitted. The similarity distribution of true French pairs may therefore sit above or below what the tuned threshold assumes. Under F<sub>0.5</sub> the consequence is asymmetric: a threshold too low for France produces false merges on French singletons at a cost of 1.0 each, whereas a threshold too high loses only part of a point per missed match. The only in-pipeline guard is the per-country match rate printed at the end of <code>main()</code>; a French rate far above the seen countries' is the signature of over-matching. Chapter 14 discusses a pseudo-unseen-country validation (train on US, validate on India) that would quantify the gap.</aside>
+
+  <h2>3.6 Profiling the Data: What profile() Logs</h2>
+  <p>Before any normalisation, <code>main()</code> calls <code>profile()</code> once per split. The function is minimal, but every line it prints answers a question that a later design choice depends on. Table 3.3 lists the lines and the decision each informs; the values are to be filled from the run log, since the pipeline has not yet been executed on the released data.</p>
+  <table class="tbl">
+    <caption>Table 3.3 — Output of <code>profile()</code> and how each line is read. Values are to be filled from the run log.</caption>
+    <thead>
+      <tr><th>Log line</th><th>Meaning</th><th>How to read it</th><th>Train</th><th>Test</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>S1=… S2+S3=…</code></td><td>Record counts per split</td><td>Their product is the pair space; with the per-S1 candidate count it gives the reduction ratio (Chapter 6)</td><td>to be filled from the run log</td><td>to be filled from the run log</td></tr>
+      <tr><td><code>S1 countries: {…}</code></td><td><code>value_counts()</code> of the raw S1 country label</td><td>Confirms the label spelling used for partitioning; a variant such as <code>usa</code> would show up as an extra key</td><td>to be filled from the run log</td><td>to be filled from the run log</td></tr>
+      <tr><td><code>S2/S3 countries: {…}</code></td><td>Same for the concatenated S2/S3 pool</td><td>Any S1 key absent here triggers the open-set fallback; France must be present in test for both lines</td><td>to be filled from the run log</td><td>to be filled from the run log</td></tr>
+      <tr><td><code>singletons: …</code></td><td>Fraction of S1 entities with an empty ground-truth list</td><td>The macro F<sub>0.5</sub> of an all-empty submission; every match the model emits must beat this baseline</td><td>to be filled from the run log</td><td>n/a (no labels)</td></tr>
+      <tr><td><code>mean matches: …  max: …</code></td><td>Mean and maximum ground-truth list length</td><td>The blocking top-k per view must exceed the maximum; the mean bounds the recall a singleton-heavy threshold may sacrifice</td><td>to be filled from the run log</td><td>n/a (no labels)</td></tr>
+      <tr><td><code>head(3)</code> of S1 and S2/S3</td><td>First three raw rows of each frame</td><td>Verifies that tabs were parsed into four columns and exposes the dominant surface noise at a glance</td><td>to be filled from the run log</td><td>to be filled from the run log</td></tr>
+    </tbody>
+  </table>
+  <p>The singleton fraction is the most consequential line. Because a correctly predicted singleton scores 1.0 and a wrongly matched one scores 0.0, the fraction sets the floor that any model must exceed and defines how much of the macro average is at stake in the threshold choice; this is why the sweep in Chapter 9 scores singletons together with matched entities rather than tuning on matched entities alone. The country dictionaries are checked next: a label present in S1 but absent from S2/S3 is not an error but a signal that the fallback path, with its larger blocks, will run for that group. The maximum list length must be compared with <code>k_name = 25</code>, <code>k_full = 25</code>, <code>k_addr = 10</code> and <code>k_postal = 10</code>: an S1 entity with more true records than the union of the views can return is capped in recall by construction, and the blocking recall ceiling logged later in <code>main()</code> (see Chapter 6) is where that cap becomes measurable.</p>
+</section>
