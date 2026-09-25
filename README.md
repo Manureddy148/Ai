@@ -29,7 +29,11 @@ The solution is a single script: text normalisation, per-country TF-IDF char n-g
 │   └── kaggle_run.ipynb               end-to-end Kaggle runner: data download, pipeline, validation, submission zip
 ├── utils/
 │   ├── validate_submission.py         stdlib-only checker for the output format rules
-│   └── score.py                       stdlib-only macro F0.5 scorer (per-country / per-size breakdowns)
+│   ├── score.py                       stdlib-only macro F0.5 scorer (per-country / per-size breakdowns)
+│   └── make_synthetic_dataset.py      synthetic train/test set in the challenge format (smoke test)
+├── docs/
+│   ├── Architecture.pdf               architecture and design document (rendered)
+│   └── architecture/                  its HTML sources: sections/*.html, style.css, build_doc.py
 └── 6ab5628d5a817_amazon_ml_challenge_problem_statement.pdf
 ```
 
@@ -51,6 +55,23 @@ python code/business_entity_resolution/src/er_pipeline.py --data-dir dataset --o
 python3 utils/validate_submission.py --matching output/matching_results.tsv \
     --candidate output/candidate_pairs.tsv --test-dir dataset/test
 ```
+
+### Smoke test without the real data
+
+```bash
+python3 utils/make_synthetic_dataset.py /tmp/synth
+python code/business_entity_resolution/src/er_pipeline.py --data-dir /tmp/synth --out-dir /tmp/synth_out
+python3 utils/validate_submission.py --matching /tmp/synth_out/matching_results.tsv \
+    --candidate /tmp/synth_out/candidate_pairs.tsv --test-dir /tmp/synth/test
+python3 utils/score.py --pred /tmp/synth_out/matching_results.tsv \
+    --truth /tmp/synth/test_ground_truth_hidden.tsv --source1 /tmp/synth/test/test_source1.tsv --by-size
+```
+
+The synthetic set (3,000 train / 1,500 test S1 entities, US + India + France in test) runs end-to-end in about 30 s and exercises every stage, the validator and the scorer.
+
+### Rebuilding the architecture document
+
+`python3 docs/architecture/build_doc.py` assembles `docs/architecture/sections/*.html` with `style.css` and renders `docs/Architecture.pdf` with headless Chromium (two passes, so the table of contents carries page numbers). Requires `pip install pymupdf`.
 
 The run log prints the blocking recall ceiling and the out-of-fold macro F0.5 with the selected decision parameters. `utils/score.py --pred <predictions.tsv> --truth dataset/train/train_ground_truth.tsv --source1 dataset/train/train_source1.tsv --by-size` scores any prediction file in ground-truth format.
 

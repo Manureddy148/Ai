@@ -1,0 +1,142 @@
+<section class="chapter" id="ch-01">
+  <h1><span class="num">1</span> Executive Summary</h1>
+  <p class="lead">This document describes the architecture of a record-linkage system for the Amazon ML Challenge on Business Entity Resolution. The system links every Source&nbsp;1 business record to the Source&nbsp;2 and Source&nbsp;3 records that describe the same business, or declares it a singleton, using only the provided files. It is one Python module, <code>er_pipeline.py</code>, with the stages load, normalise, block, pair features, LightGBM matcher, (threshold, ratio) decode and TSV output. Every design decision follows from the metric: macro-averaged F<sub>0.5</sub> per Source&nbsp;1 entity, where a singleton scores 1.0 only when the predicted list is empty.</p>
+
+  <h2>1.1 Purpose and scope</h2>
+  <p>The document serves two audiences. For challenge reviewers it is the technical companion to the methodology write-up: it explains, at the level of functions, regular expressions and parameter values, how the pipeline turns the input files into <code>matching_results.tsv</code> and <code>candidate_pairs.tsv</code>, and why each stage is shaped as it is. For maintainers it is the reference for the data contracts between stages, the memory budget, the validation protocol and the known limitations. Every claim is tied to the code in <code>er_pipeline.py</code>. The pipeline has not yet been executed on the challenge data; any quantity that only a run can produce is marked <em>to be filled from the run log</em>, and no measured result appears in this document.</p>
+
+  <h2>1.2 The problem</h2>
+  <p>Three independent sources describe the same population of businesses without a shared identifier. Each record carries an <code>entity_id</code> whose prefix (<code>S1-</code>, <code>S2-</code>, <code>S3-</code>) names its source, a free-text <code>business_name</code>, a free-text <code>business_address</code> and a <code>country</code> label. Source&nbsp;1 is the deduplicated reference: a Source&nbsp;1 entity may correspond to zero, one or many records in Sources&nbsp;2 and&nbsp;3, while a Source&nbsp;2 or&nbsp;3 record belongs to at most one Source&nbsp;1 entity. The fields carry the noise typical of business directories: abbreviated or expanded legal forms, trade names introduced by markers such as <em>dba</em>, ampersands versus <em>and</em>, transposed or missing tokens, typos, abbreviated street types, missing postal codes and landmark-based addresses. Training data cover the United States and India with a ground-truth file; the test data add France, never seen in training, whose records must all be resolved (see Chapter&nbsp;3).</p>
+  <p>The scoring rule shapes the solution more than any property of the data. For each Source&nbsp;1 entity the organisers compute F<sub>0.5</sub> = 1.25·P·R / (0.25·P + R), with P and R the precision and recall of the predicted list against the true list, and average over all Source&nbsp;1 entities. With β&nbsp;=&nbsp;0.5 precision is weighted twice as heavily as recall: one wrongly merged record costs more than one missed record. Singletons are included and scored in a binary way: an entity with no true match earns 1.0 if the predicted list is empty and 0.0 otherwise. A system must therefore be conservative on every entity and treat "no match" as a first-class prediction (see Chapter&nbsp;2).</p>
+
+  <h2>1.3 The solution</h2>
+  <p>The system is a supervised record-linkage pipeline with the seven stages of Figure&nbsp;1.1. <strong>Load</strong> (<code>load_split()</code>) reads the three source files of a split with an explicit tab separator, no quoting and no missing-value parsing, concatenates Sources&nbsp;2 and&nbsp;3 into one frame, and parses the ground truth into a dictionary from Source&nbsp;1 id to a set of matched ids. <strong>Normalise</strong> (<code>prep()</code>) derives for every record an ASCII-folded, abbreviation-expanded name (<code>name_n</code>), a core name with legal forms removed (<code>name_c</code>), alias variants split on markers such as <em>dba</em> (<code>name_alts</code>), a normalised, stop-word-free address (<code>addr_n</code>, <code>addr_c</code>), the postal code, the digit runs, the leading house number and a normalised country. <strong>Block</strong> (<code>block()</code>) fits TF-IDF character 2–4-gram vectorisers on three views (core name, name plus address, address) and, within each country, retrieves the top-k Source&nbsp;2/3 neighbours per view (k&nbsp;=&nbsp;25, 25 and 10) with the chunked sparse product in <code>topk_sparse()</code>; a fourth view restricted to a shared postal code adds up to 10 name-cosine neighbours. The union, filtered at cosine &gt;&nbsp;0.05, is the candidate table and is written verbatim as <code>candidate_pairs.tsv</code>.</p>
+  <p><strong>Features</strong> (<code>features()</code>) computes per candidate pair the three view cosines, rapidfuzz and Jaro-Winkler similarities on core names, token Jaccard, first-token, initials, alias and acronym agreement, address similarities, ternary postal-code and house-number agreement, street-number overlap and conflict, lengths, a source flag, and contextual features that compare the pair with the competing candidates of the same Source&nbsp;1 entity and of the same Source&nbsp;2/3 record (gap to the best competitor, rank, candidate count). <strong>Match</strong> trains a LightGBM binary classifier on the labelled training pairs with 5-fold <code>GroupKFold</code> grouped by Source&nbsp;1 entity, yielding out-of-fold probabilities and a final model refit on all pairs. <strong>Decode</strong> (<code>decode_table()</code>, <code>decide()</code>) assigns each Source&nbsp;2/3 record to the Source&nbsp;1 entity that scores it highest and keeps a pair only when its probability reaches an absolute threshold <em>and</em> a fixed fraction of the best probability in its (Source&nbsp;1, source) group; (thr, ratio) is chosen by exhaustive sweep on the out-of-fold macro F<sub>0.5</sub> from <code>macro_f05()</code> over all training entities, singletons included. <strong>Write</strong> emits one row per test Source&nbsp;1 entity in each TSV with de-duplicated id lists.</p>
+
+  <figure>
+    <svg viewBox="0 0 800 250" width="100%" role="img" aria-label="Seven-stage pipeline with artefacts flowing between stages">
+      <defs>
+        <marker id="ch01-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="#334155"/>
+        </marker>
+      </defs>
+      <text x="458" y="30" font-family="inherit" font-size="13" fill="#0f172a" text-anchor="middle">train only: y from ground truth</text>
+      <text x="574" y="30" font-family="inherit" font-size="13" fill="#0f172a" text-anchor="middle">GroupKFold OOF</text>
+      <text x="690" y="30" font-family="inherit" font-size="13" fill="#0f172a" text-anchor="middle">(thr, ratio) swept</text>
+      <line x1="458" y1="36" x2="458" y2="52" stroke="#334155" stroke-width="1" stroke-dasharray="3 3"/>
+      <line x1="574" y1="36" x2="574" y2="52" stroke="#334155" stroke-width="1" stroke-dasharray="3 3"/>
+      <line x1="690" y1="36" x2="690" y2="52" stroke="#334155" stroke-width="1" stroke-dasharray="3 3"/>
+
+      <rect x="4" y="54" width="96" height="64" rx="6" fill="#e2e8f0" stroke="#334155" stroke-width="1.5"/>
+      <text x="52" y="80" font-family="inherit" font-size="14" font-weight="bold" fill="#0f172a" text-anchor="middle">Load</text>
+      <text x="52" y="102" font-family="inherit" font-size="13" fill="#0f172a" text-anchor="middle">load_split()</text>
+
+      <rect x="120" y="54" width="96" height="64" rx="6" fill="#dbeafe" stroke="#334155" stroke-width="1.5"/>
+      <text x="168" y="80" font-family="inherit" font-size="14" font-weight="bold" fill="#0f172a" text-anchor="middle">Normalise</text>
+      <text x="168" y="102" font-family="inherit" font-size="13" fill="#0f172a" text-anchor="middle">prep()</text>
+
+      <rect x="236" y="54" width="96" height="64" rx="6" fill="#dbeafe" stroke="#334155" stroke-width="1.5"/>
+      <text x="284" y="80" font-family="inherit" font-size="14" font-weight="bold" fill="#0f172a" text-anchor="middle">Block</text>
+      <text x="284" y="102" font-family="inherit" font-size="13" fill="#0f172a" text-anchor="middle">block()</text>
+
+      <rect x="352" y="54" width="96" height="64" rx="6" fill="#dbeafe" stroke="#334155" stroke-width="1.5"/>
+      <text x="400" y="80" font-family="inherit" font-size="14" font-weight="bold" fill="#0f172a" text-anchor="middle">Features</text>
+      <text x="400" y="102" font-family="inherit" font-size="13" fill="#0f172a" text-anchor="middle">features()</text>
+
+      <rect x="468" y="54" width="96" height="64" rx="6" fill="#dcfce7" stroke="#334155" stroke-width="1.5"/>
+      <text x="516" y="80" font-family="inherit" font-size="14" font-weight="bold" fill="#0f172a" text-anchor="middle">Match</text>
+      <text x="516" y="102" font-family="inherit" font-size="13" fill="#0f172a" text-anchor="middle">lgb.train()</text>
+
+      <rect x="584" y="54" width="96" height="64" rx="6" fill="#fef3c7" stroke="#334155" stroke-width="1.5"/>
+      <text x="632" y="80" font-family="inherit" font-size="14" font-weight="bold" fill="#0f172a" text-anchor="middle">Decode</text>
+      <text x="632" y="102" font-family="inherit" font-size="13" fill="#0f172a" text-anchor="middle">decide()</text>
+
+      <rect x="700" y="54" width="96" height="64" rx="6" fill="#e2e8f0" stroke="#334155" stroke-width="1.5"/>
+      <text x="748" y="80" font-family="inherit" font-size="14" font-weight="bold" fill="#0f172a" text-anchor="middle">Write</text>
+      <text x="748" y="102" font-family="inherit" font-size="13" fill="#0f172a" text-anchor="middle">two TSVs</text>
+
+      <line x1="100" y1="86" x2="118" y2="86" stroke="#334155" stroke-width="1.5" marker-end="url(#ch01-arrow)"/>
+      <line x1="216" y1="86" x2="234" y2="86" stroke="#334155" stroke-width="1.5" marker-end="url(#ch01-arrow)"/>
+      <line x1="332" y1="86" x2="350" y2="86" stroke="#334155" stroke-width="1.5" marker-end="url(#ch01-arrow)"/>
+      <line x1="448" y1="86" x2="466" y2="86" stroke="#334155" stroke-width="1.5" marker-end="url(#ch01-arrow)"/>
+      <line x1="564" y1="86" x2="582" y2="86" stroke="#334155" stroke-width="1.5" marker-end="url(#ch01-arrow)"/>
+      <line x1="680" y1="86" x2="698" y2="86" stroke="#334155" stroke-width="1.5" marker-end="url(#ch01-arrow)"/>
+
+      <line x1="110" y1="118" x2="110" y2="150" stroke="#334155" stroke-width="1" stroke-dasharray="3 3"/>
+      <line x1="226" y1="118" x2="226" y2="192" stroke="#334155" stroke-width="1" stroke-dasharray="3 3"/>
+      <line x1="342" y1="118" x2="342" y2="150" stroke="#334155" stroke-width="1" stroke-dasharray="3 3"/>
+      <line x1="458" y1="118" x2="458" y2="192" stroke="#334155" stroke-width="1" stroke-dasharray="3 3"/>
+      <line x1="574" y1="118" x2="574" y2="150" stroke="#334155" stroke-width="1" stroke-dasharray="3 3"/>
+      <line x1="690" y1="118" x2="690" y2="192" stroke="#334155" stroke-width="1" stroke-dasharray="3 3"/>
+
+      <rect x="46" y="150" width="128" height="34" rx="6" fill="#f1f5f9" stroke="#334155" stroke-width="1"/>
+      <text x="110" y="172" font-family="inherit" font-size="13" fill="#0f172a" text-anchor="middle">S1 and S2+S3 frames</text>
+
+      <rect x="162" y="192" width="128" height="34" rx="6" fill="#f1f5f9" stroke="#334155" stroke-width="1"/>
+      <text x="226" y="214" font-family="inherit" font-size="13" fill="#0f172a" text-anchor="middle">name_c, addr_c, postal</text>
+
+      <rect x="278" y="150" width="128" height="34" rx="6" fill="#f1f5f9" stroke="#334155" stroke-width="1"/>
+      <text x="342" y="172" font-family="inherit" font-size="13" fill="#0f172a" text-anchor="middle">(i1, i2) + cos_*</text>
+
+      <rect x="394" y="192" width="128" height="34" rx="6" fill="#f1f5f9" stroke="#334155" stroke-width="1"/>
+      <text x="458" y="214" font-family="inherit" font-size="13" fill="#0f172a" text-anchor="middle">pair feature table</text>
+
+      <rect x="510" y="150" width="128" height="34" rx="6" fill="#f1f5f9" stroke="#334155" stroke-width="1"/>
+      <text x="574" y="172" font-family="inherit" font-size="13" fill="#0f172a" text-anchor="middle">p per pair (OOF, test)</text>
+
+      <rect x="626" y="192" width="128" height="34" rx="6" fill="#f1f5f9" stroke="#334155" stroke-width="1"/>
+      <text x="690" y="214" font-family="inherit" font-size="13" fill="#0f172a" text-anchor="middle">match lists per S1</text>
+    </svg>
+    <figcaption>Figure 1.1 — High-level pipeline: the seven stages of <code>main()</code> and the artefact each stage hands to the next. The same <code>prep()</code> → <code>block()</code> → <code>features()</code> path runs on the training and the test split; labels, out-of-fold probabilities and the (thr, ratio) sweep exist only on the training side.</figcaption>
+  </figure>
+
+  <h2>1.4 Key design principles</h2>
+  <p>Five principles run through every stage; Table&nbsp;1.1 records where each is realised in the code.</p>
+  <ul>
+    <li><strong>Precision first.</strong> Because F<sub>0.5</sub> penalises a false merge more than a missed link, the decision layer never uses a naive 0.5 cut-off: it combines an absolute threshold, a relative ratio to the strongest competitor in the same (Source&nbsp;1, source) group and a one-Source-1-per-record constraint, and selects the operating point directly on the official metric.</li>
+    <li><strong>Singleton awareness.</strong> <code>f05()</code> reproduces the organisers' rule exactly, and the (thr, ratio) sweep averages over every training entity, so the cost of a spurious link on a singleton is part of the objective being optimised.</li>
+    <li><strong>Open-set country.</strong> Country only partitions blocking; a label absent from Sources&nbsp;2 and&nbsp;3 falls back to the whole index, the normalisation tables include French legal forms and address idioms, and the vectorisers are refit per split, so France is handled without any code path that names it.</li>
+    <li><strong>Memory-bounded computation.</strong> Top-k retrieval densifies one chunk of Source&nbsp;1 rows at a time, sized from the block width to a budget of 2×10<sup>7</sup> cells, and pair cosines are computed in slices of 200,000 pairs, so peak memory does not grow with a country block or the candidate table.</li>
+    <li><strong>No external data.</strong> The only inputs are the provided TSVs; there is no gazetteer, registry, geocoder, pretrained model or web access, and the matcher is an MIT-licensed LightGBM ensemble far below the 8-billion-parameter limit.</li>
+  </ul>
+
+  <table class="tbl">
+    <caption>Table 1.1 — Design principle and where it is realised in <code>er_pipeline.py</code></caption>
+    <thead>
+      <tr><th>Principle</th><th>Mechanism</th><th>Location in code</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Precision first</td><td>Keep a pair only if p ≥ thr and p ≥ ratio·best; each S2/S3 record assigned to its highest-scoring S1; (thr, ratio) chosen by exhaustive sweep on out-of-fold macro F<sub>0.5</sub></td><td><code>decide()</code>, <code>decode_table()</code> (<code>drop_duplicates("i2")</code>), sweep loop in <code>main()</code></td></tr>
+      <tr><td>Singleton aware</td><td>Per-entity score is 1.0 iff truth and prediction are both empty; macro average runs over all S1 ids, not only matched ones; empty rows written for unmatched entities</td><td><code>f05()</code>, <code>macro_f05()</code> with keys <code>tr1.entity_id</code>, TSV writer in <code>main()</code></td></tr>
+      <tr><td>Open-set country</td><td>Blocking groups on <code>country_n</code>; unseen or blank labels compare against all S2/S3 rows; French forms in the normalisation tables; vectorisers fit per split</td><td><code>block()</code> (<code>other_countries</code> fallback), <code>LEGAL</code>, <code>NAME_ABBR</code>, <code>ADDR_ABBR</code>, <code>ADDR_STOP</code></td></tr>
+      <tr><td>Memory bounded</td><td>Chunk size = max(16, 2×10<sup>7</sup> // |B|); argpartition slice copied; float32 TF-IDF; pair cosines in 200k-pair slices</td><td><code>topk_sparse()</code>, <code>pair_cos()</code>, <code>TfidfVectorizer(dtype=np.float32)</code></td></tr>
+      <tr><td>No external data</td><td>Reads only <code>*_source{1,2,3}.tsv</code> and <code>train_ground_truth.tsv</code>; no network calls except an optional package install; model is LightGBM (MIT)</td><td><code>find_data_dir()</code>, <code>read_tsv()</code>, <code>load_split()</code>, <code>params</code> in <code>main()</code></td></tr>
+      <tr><td>Train/test parity</td><td>Identical normalise → block → features path for both splits; matches are a subset of candidates by construction; id lists de-duplicated with <code>dict.fromkeys</code></td><td><code>prep()</code>, <code>block()</code>, <code>features()</code>, <code>to_lists()</code>, writer in <code>main()</code></td></tr>
+    </tbody>
+  </table>
+
+  <aside class="note"><strong>Design note.</strong> The sweep includes ratio&nbsp;=&nbsp;0, which reduces <code>decide()</code> to a flat per-pair threshold. The relative rule is adopted only when it improves the out-of-fold macro F<sub>0.5</sub>, so it can never make the validated score worse than threshold-only tuning.</aside>
+
+  <h2>1.5 What is delivered</h2>
+  <p>The package follows the structure the organisers require. <code>code/business_entity_resolution/src/er_pipeline.py</code> is the complete pipeline; <code>requirements.txt</code> pins its dependencies (NumPy, pandas, scikit-learn, rapidfuzz, LightGBM) and <code>README.md</code> gives the run command. <code>utils/validate_submission.py</code> checks both output files against every formatting rule, and <code>utils/score.py</code> computes macro F<sub>0.5</sub> on a labelled split. <code>notebooks/kaggle_run.ipynb</code> runs the script in a Kaggle session, where the data directory is auto-detected under <code>/kaggle/input</code>, and packages the zip. <code>Documentation_template.md</code> holds the methodology write-up, and this document sits under <code>docs/architecture/</code>. The <code>output/</code> folder receives <code>matching_results.tsv</code> and <code>candidate_pairs.tsv</code> once the pipeline has been run (see Chapter&nbsp;11).</p>
+
+  <aside class="warn"><strong>Risk.</strong> Every quantitative claim is conditional on a run that has not yet taken place. Blocking recall, out-of-fold macro F<sub>0.5</sub>, the selected (thr, ratio) and per-country match rates remain placeholders until the run log exists (Chapters&nbsp;10 and&nbsp;12).</aside>
+
+  <h2>1.6 Document map</h2>
+  <dl>
+    <dt>Chapter 2</dt><dd>Problem Statement and Evaluation Metric: task, file contracts, the F<sub>0.5</sub> formula and its singleton rule.</dd>
+    <dt>Chapter 3</dt><dd>Data Understanding and Noise Taxonomy: schema, country split, catalogue of name and address noise.</dd>
+    <dt>Chapter 4</dt><dd>System Architecture Overview: stage graph, inter-stage data frames, control flow of <code>main()</code>.</dd>
+    <dt>Chapter 5</dt><dd>Text Normalisation Layer: <code>basic()</code>, alias splitting, abbreviation and legal-form tables, postal and number extraction.</dd>
+    <dt>Chapter 6</dt><dd>Candidate Generation (Blocking): TF-IDF views, postal view, per-country top-k in <code>topk_sparse()</code>, recall diagnostics.</dd>
+    <dt>Chapter 7</dt><dd>Pair Feature Engineering: every column of <code>features()</code>, including the contextual gap, rank and crowding features.</dd>
+    <dt>Chapter 8</dt><dd>Matching Model: LightGBM parameters, GroupKFold protocol, early stopping, out-of-fold predictions and refit.</dd>
+    <dt>Chapter 9</dt><dd>Decision Layer: <code>decode_table()</code>, <code>decide()</code>, the (thr, ratio) sweep and its link to F<sub>0.5</sub>.</dd>
+    <dt>Chapter 10</dt><dd>Validation Strategy and Tooling: log diagnostics, <code>score.py</code>, <code>validate_submission.py</code>, run-log placeholder table.</dd>
+    <dt>Chapter 11</dt><dd>Outputs, Packaging and Reproducibility: TSV writer, submission zip, Kaggle notebook, reproduction command.</dd>
+    <dt>Chapter 12</dt><dd>Performance, Complexity and Scalability: time and memory profile of each stage and the parameters that bound them.</dd>
+    <dt>Chapter 13</dt><dd>Fair Play, Licensing and Constraint Compliance: no-external-data audit, dependency licences, model-size limit.</dd>
+    <dt>Chapter 14</dt><dd>Limitations, Risks and Roadmap: pairwise-only decoding, single global operating point, unvalidated French transfer.</dd>
+    <dt>Chapter 15</dt><dd>Appendices: full feature list, normalisation tables, regular expressions, command-line interface.</dd>
+  </dl>
+</section>
