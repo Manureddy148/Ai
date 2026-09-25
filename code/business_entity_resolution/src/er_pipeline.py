@@ -1,7 +1,8 @@
 """Business Entity Resolution — end-to-end baseline pipeline.
 
 data -> normalisation -> blocking (TF-IDF char n-gram top-k) -> pair features
-     -> LightGBM matcher (GroupKFold OOF) -> F0.5-tuned threshold -> output TSVs
+     -> LightGBM matcher (GroupKFold OOF) -> F0.5-tuned (threshold, relative-ratio) per-S1 decode
+     -> output TSVs
 
 Run (Kaggle cell or shell):
     python er_pipeline.py --data-dir <dir containing train/ and test/> --out-dir output
@@ -19,7 +20,6 @@ from glob import glob
 
 import numpy as np
 import pandas as pd
-import scipy.sparse as sp
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.model_selection import GroupKFold
 
@@ -93,7 +93,7 @@ NAME_ABBR = {
     "pvt": "private", "pvtltd": "private limited", "intl": "international",
     "mfg": "manufacturing", "svc": "services", "svcs": "services", "bros": "brothers",
     "assoc": "associates", "natl": "national", "tech": "technologies", "grp": "group",
-    "ent": "enterprises", "cie": "compagnie", "ste": "societe", "sté": "societe",
+    "ent": "enterprises", "cie": "compagnie", "ste": "societe",
 }
 LEGAL = {
     "corporation", "company", "incorporated", "limited", "private", "llc", "llp", "lp",
@@ -119,12 +119,18 @@ _punct = re.compile(r"[^a-z0-9 ]+")
 _space = re.compile(r"\s+")
 _digits = re.compile(r"\d+")
 _postal = re.compile(r"\b(\d{5,6})(?:-\d{4})?\b")
+_dotted = re.compile(r"(?<![a-z])(?:[a-z]\.){2,}[a-z]?(?![a-z])")  # u.s.a / p.v.t. / a.b.c
+# alias markers are matched on the RAW string, before basic() destroys '/' and '.'
+# (deliberately no bare 'aka': it can be a legitimate name token)
+_ALIAS = re.compile(
+    r"\b(?:d\s*/\s*b\s*/\s*a|d\.b\.a\.?|dba|doing business as|trading as|t\s*/\s*a"
+    r"|a\s*/\s*k\s*/\s*a|a\.k\.a\.?|also known as|formerly(?: known as)?)\b", re.I)
 
 
 def basic(s):
     s = unicodedata.normalize("NFKD", str(s)).encode("ascii", "ignore").decode().lower()
     s = s.replace("&", " and ").replace("@", " at ")
-    s = re.sub(r"(?<=[a-z])\.(?=[a-z]\.)", "", s)  # p.v.t. -> pvt
+    s = _dotted.sub(lambda m: m.group(0).replace(".", ""), s)  # u.s.a -> usa, p.v.t. -> pvt
     s = _punct.sub(" ", s)
     return _space.sub(" ", s).strip()
 
@@ -142,41 +148,89 @@ def core_name(n):
     return " ".join(toks) if toks else n
 
 
+def name_parts(raw):
+    """Alias variants of a raw business name (legal name, DBA/trade name, ...), each core-normalised."""
+    parts = [core_name(norm_name(p)) for p in _ALIAS.split(str(raw))]
+    parts = [p for p in parts if p]
+    return parts or [core_name(norm_name(raw))]
+
+
 def norm_addr(s):
     return expand(basic(s), ADDR_ABBR)
 
 
+def _addr_nums(a, p):
+    """Digit runs of a normalised address minus the postal code, plus the leading (house) number."""
+    ns = _digits.findall(a)
+    # remove the postal code from the number set, but not when it is the leading
+    # number of the address: a 5-digit US house number with the ZIP missing is
+    # also captured by _postal and must stay available as the house number.
+    if p and p in ns and (ns[0] != p or a.endswith(p)):
+        i = len(ns) - 1 - ns[::-1].index(p)   # drop the last occurrence
+        ns = ns[:i] + ns[i + 1:]
+    return frozenset(ns), (ns[0] if ns else "")
+
+
 def prep(df):
     df = df.copy()
-    df["name_n"] = df.business_name.map(norm_name)
+    # strip explicit alias markers (dba, d/b/a, t/a, ...) before normalisation; the
+    # concatenation of legal + trade name is kept in name_n/name_c so blocking and the
+    # existing features keep their recall
+    df["name_n"] = df.business_name.map(lambda s: norm_name(" ".join(_ALIAS.split(str(s)))))
     df["name_c"] = df.name_n.map(core_name)
+    df["name_alts"] = df.business_name.map(name_parts)
     df["addr_n"] = df.business_address.map(norm_addr)
     df["addr_c"] = df.addr_n.map(lambda a: " ".join(t for t in a.split() if t not in ADDR_STOP))
     df["postal"] = df.business_address.map(
         lambda a: (_postal.findall(str(a)) or [""])[-1])
-    df["nums"] = df.addr_n.map(lambda a: frozenset(_digits.findall(a)))
+    tmp = [_addr_nums(a, p) for a, p in zip(df.addr_n, df.postal)]
+    df["nums"] = [t[0] for t in tmp]
+    df["house"] = [t[1] for t in tmp]
     df["country_n"] = df.country.map(basic)
     df["src"] = df.entity_id.str[:2]
     return df.reset_index(drop=True)
 
 
 # --------------------------------------------------------------------------- #
-# Blocking: per-country TF-IDF char n-gram top-k (name) ∪ top-k (name+addr)
+# Blocking: per-country TF-IDF char n-gram top-k (name) ∪ top-k (name+addr) ∪ top-k (addr)
+#           ∪ same-postal top-k (name)
 # --------------------------------------------------------------------------- #
-def topk_sparse(A, B, k, chunk=2000):
-    """For each row of A, indices and scores of the top-k rows of B (cosine; rows L2-normed)."""
-    idx_out, sc_out = [], []
+def topk_sparse(A, B, k, max_cells=2e7):
+    """For each row of A, indices and scores of the top-k rows of B (cosine; rows L2-normed).
+
+    Chunk size is derived from |B| so the dense chunk x |B| transient (float32 scores +
+    int64 argpartition + the sparse product itself) stays a few hundred MB regardless of
+    block size. The argpartition slice is copied so the full-width int64 array is not
+    kept alive by a view across iterations.
+    """
+    n_b = B.shape[0]
+    k = min(k, n_b)
+    if k == 0 or A.shape[0] == 0:
+        return (np.empty((A.shape[0], 0), dtype=np.int64),
+                np.empty((A.shape[0], 0), dtype=np.float32))
     BT = B.T.tocsr()
-    k = min(k, B.shape[0])
+    chunk = max(16, int(max_cells // n_b))
+    idx_out, sc_out = [], []
     for i in range(0, A.shape[0], chunk):
-        S = (A[i:i + chunk] @ BT).toarray()
-        part = np.argpartition(-S, k - 1, axis=1)[:, :k]
+        S = (A[i:i + chunk] @ BT).toarray()                 # float32 chunk x |B|
+        part = np.argpartition(S, S.shape[1] - k, axis=1)[:, -k:].copy()  # top-k, no -S copy, no retained view
         idx_out.append(part)
         sc_out.append(np.take_along_axis(S, part, axis=1))
     return np.vstack(idx_out), np.vstack(sc_out)
 
 
-def block(s1, other, k_name=25, k_full=25, k_addr=10):
+def pair_cos(A, B, i1, i2, chunk=200_000):
+    """Row-wise cosine of A[i1[j]] and B[i2[j]] (rows are L2-normed), computed in
+    slices of pairs so that peak memory is bounded regardless of the pair count."""
+    out = np.empty(len(i1), dtype=np.float32)
+    for s in range(0, len(i1), chunk):
+        a = A[i1[s:s + chunk]]
+        b = B[i2[s:s + chunk]]
+        out[s:s + chunk] = np.asarray(a.multiply(b).sum(axis=1)).ravel()
+    return out
+
+
+def block(s1, other, k_name=25, k_full=25, k_addr=10, k_postal=10):
     fields = {
         "name": (s1.name_c, other.name_c, k_name),
         "full": (s1.name_c + " | " + s1.addr_c, other.name_c + " | " + other.addr_c, k_full),
@@ -204,13 +258,27 @@ def block(s1, other, k_name=25, k_full=25, k_addr=10):
             keep = sc > 0.05
             rows = np.repeat(i1, idx.shape[1]).reshape(idx.shape)
             chunks.append(np.column_stack([rows[keep], i2[idx[keep]]]))
+        # 4th view, orthogonal to the fuzzy ones: same postal code (zip / PIN), ranked by
+        # name cosine. Catches true matches with heavily noisy names inside one postal block.
+        A, B = vecs["name"]
+        by_postal = {p: i2[pos] for p, pos in
+                     pd.Series(np.arange(len(i2))).groupby(other.postal.values[i2]).indices.items()
+                     if p}
+        for p, pos in g1.groupby("postal").indices.items():
+            if not p or p not in by_postal:
+                continue
+            j1, j2 = i1[pos], by_postal[p]
+            idx, sc = topk_sparse(A[j1], B[j2], k_postal)
+            keep = sc > 0.05
+            rows = np.repeat(j1, idx.shape[1]).reshape(idx.shape)
+            chunks.append(np.column_stack([rows[keep], j2[idx[keep]]]))
     cand = pd.DataFrame(np.vstack(chunks) if chunks else np.empty((0, 2), int),
                         columns=["i1", "i2"]).drop_duplicates().reset_index(drop=True)
-    # cosine similarities for every surviving pair (all three views)
+    # cosine similarities for every surviving pair (all three views), sliced to bound memory
+    i1, i2 = cand.i1.to_numpy(), cand.i2.to_numpy()
     for key in fields:
         A, B = vecs[key]
-        cand[f"cos_{key}"] = np.asarray(
-            A[cand.i1.values].multiply(B[cand.i2.values]).sum(axis=1)).ravel()
+        cand[f"cos_{key}"] = pair_cos(A, B, i1, i2)
     log(f"blocking: {len(cand):,} pairs ({len(cand) / max(len(s1), 1):.1f} per S1)")
     return cand
 
@@ -239,6 +307,17 @@ def features(cand, s1, other):
     f["n_first_eq"] = [float(a.split()[:1] == b.split()[:1]) for a, b in pairs_name]
     f["n_init_eq"] = [float("".join(t[0] for t in a.split()) == "".join(t[0] for t in b.split()))
                       for a, b in pairs_name]
+    # explicit alias match: best score across every (legal|trade) name pair of the two records
+    pairs_alts = list(zip(L.name_alts, R.name_alts))
+    f["n_alias_best"] = [max(fuzz.token_sort_ratio(a, b) for a in la for b in ra) for la, ra in pairs_alts]
+    f["has_alias"] = [float(len(la) > 1 or len(ra) > 1) for la, ra in pairs_alts]
+
+    # acronym vs expansion (e.g. 'sbi' vs 'state bank india'; core_name already drops 'of')
+    def _acr(n):
+        return "".join(t[0] for t in n.split())
+    f["n_acronym"] = [float((len(a.split()) == 1 and len(b.split()) > 1 and a == _acr(b)) or
+                            (len(b.split()) == 1 and len(a.split()) > 1 and b == _acr(a)))
+                      for a, b in pairs_name]
     f["a_ratio"] = [fuzz.ratio(a, b) for a, b in pairs_addr]
     f["a_tset"] = [fuzz.token_set_ratio(a, b) for a, b in pairs_addr]
     f["a_partial"] = [fuzz.partial_ratio(a, b) for a, b in pairs_addr]
@@ -248,6 +327,8 @@ def features(cand, s1, other):
     num_l, num_r = L.nums.values, R.nums.values
     f["num_overlap"] = [len(a & b) / len(a | b) if a and b else -1 for a, b in zip(num_l, num_r)]
     f["num_conflict"] = [float(bool(a) and bool(b) and not (a & b)) for a, b in zip(num_l, num_r)]
+    lh, rh = L.house.values, R.house.values
+    f["house_state"] = np.where((lh == "") | (rh == ""), 0, np.where(lh == rh, 1, -1))
     f["len_l"] = L.name_c.str.len().values
     f["len_r"] = R.name_c.str.len().values
     f["alen_l"] = L.addr_c.str.len().values
@@ -279,12 +360,20 @@ def f05(pred, truth):
     return 1.25 * p * r / (0.25 * p + r)
 
 
-def decide(f, prob, thr):
-    """Threshold + each S2/S3 record goes to at most one S1 (S1 is deduplicated)."""
-    d = f[["i1", "i2"]].copy()
+def decode_table(f, prob):
+    """Threshold-independent part of the decode: each S2/S3 record is assigned to the S1 that
+    scores it highest, and the best probability within each (S1, source) group is recorded."""
+    d = f[["i1", "i2", "is_s3"]].copy()
     d["p"] = prob
-    d = d[d.p >= thr].sort_values("p", ascending=False).drop_duplicates("i2")
+    d = d.sort_values("p", ascending=False).drop_duplicates("i2").reset_index(drop=True)
+    d["best"] = d.groupby(["i1", "is_s3"]).p.transform("max")
     return d
+
+
+def decide(d, thr, ratio=0.0):
+    """Per-S1/per-source decode: keep a candidate if p >= thr AND p >= ratio * best probability
+    within its (S1, source) group. ratio=0 reproduces a flat per-pair threshold."""
+    return d[(d.p >= thr) & (d.p >= ratio * d.best)]
 
 
 def to_lists(d, s1, other, col="i2"):
@@ -326,6 +415,16 @@ def main():
     total_true = sum(len(v) for v in gt.values())
     log(f"blocking recall ceiling: {ftr.y.sum() / max(total_true, 1):.4f}"
         f"  (pos={ftr.y.sum():,} / true={total_true:,})")
+    # the metric is macro over S1 entities: an S1 whose true match was never blocked scores 0.0
+    n_true_s1 = sum(1 for v in gt.values() if v)
+    n_hit_s1 = ftr.loc[ftr.y == 1, "i1"].nunique()
+    log(f"S1 entities with >=1 true match blocked: {n_hit_s1:,}/{n_true_s1:,}")
+    true_c = pd.Series({e: len(gt.get(e, ())) for e in tr1.entity_id}).groupby(tr1.country_n.values).sum()
+    pos_c = ftr.y.groupby(tr1.country_n.values[ftr.i1.values]).sum()
+    log(f"blocking recall by country: {(pos_c / true_c.clip(lower=1)).round(4).to_dict()}")
+    true_s = pd.Series([x[:2] for v in gt.values() for x in v]).value_counts()
+    pos_s = ftr.y.groupby(tr2.src.values[ftr.i2.values]).sum()
+    log(f"blocking recall by source: {(pos_s / true_s.clip(lower=1)).round(4).to_dict()}")
 
     feats = [c for c in ftr.columns if c not in ("i1", "i2", "y")]
     params = dict(objective="binary", learning_rate=0.05, num_leaves=63,
@@ -341,15 +440,20 @@ def main():
         iters.append(m.best_iteration)
         log(f"fold {k}: best_iter={m.best_iteration}")
 
-    best_thr, best = 0.5, -1
-    for thr in np.arange(0.20, 0.96, 0.025):
-        s = macro_f05(to_lists(decide(ftr, oof, thr), tr1, tr2), gt, tr1.entity_id.values)
-        if s > best:
-            best_thr, best = thr, s
-    log(f"OOF macro F0.5 = {best:.4f} at threshold {best_thr:.3f}")
+    dtr = decode_table(ftr, oof)
+    best_thr, best_ratio, best = 0.5, 0.0, -1.0
+    for ratio in (0.0, 0.6, 0.7, 0.8, 0.9, 1.0):
+        for thr in np.arange(0.20, 0.96, 0.025):
+            s = macro_f05(to_lists(decide(dtr, thr, ratio), tr1, tr2), gt, tr1.entity_id.values)
+            if s > best:
+                best_thr, best_ratio, best = float(thr), ratio, s
+    log(f"OOF macro F0.5 = {best:.4f} at thr={best_thr:.3f} ratio={best_ratio}")
     cand_lists = to_lists(ftr[["i1", "i2"]], tr1, tr2)
-    log(f"OOF F0.5 if every candidate were predicted: "
-        f"{macro_f05(cand_lists, gt, tr1.entity_id.values):.4f} (sanity)")
+    log(f"macro F0.5 if every candidate were predicted (no model; floor): "
+        f"{macro_f05(cand_lists, gt, tr1.entity_id.values):.4f}")
+    oracle = to_lists(ftr.loc[ftr.y == 1, ["i1", "i2"]], tr1, tr2)
+    log(f"blocking oracle macro F0.5 (predict exactly the true candidate pairs; ceiling): "
+        f"{macro_f05(oracle, gt, tr1.entity_id.values):.4f}")
 
     model = lgb.train(params, lgb.Dataset(ftr[feats], ftr.y), int(np.mean(iters) * 1.1))
     imp = pd.Series(model.feature_importance("gain"), feats).sort_values(ascending=False)
@@ -359,7 +463,7 @@ def main():
     cte = block(te1, te2)
     fte = features(cte, te1, te2)
     pte = model.predict(fte[feats])
-    matches = to_lists(decide(fte, pte, best_thr), te1, te2)
+    matches = to_lists(decide(decode_table(fte, pte), best_thr, best_ratio), te1, te2)
     cands = to_lists(fte[["i1", "i2"]], te1, te2)
 
     os.makedirs(args.out_dir, exist_ok=True)

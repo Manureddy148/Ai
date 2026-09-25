@@ -1,0 +1,15 @@
+# datasets and archives (too large / not redistributable)
+dataset/
+data/
+*.zip
+
+# generated pipeline outputs
+output/*.tsv
+
+# python / jupyter
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# stray root notebook file
+/amazon_ai
