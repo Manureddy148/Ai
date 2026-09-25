@@ -45,7 +45,7 @@ The final submission zip contains `output/{matching_results.tsv,candidate_pairs.
 
 ### Kaggle notebook (recommended)
 
-Upload `notebooks/kaggle_run.ipynb` to Kaggle, enable internet, and run all cells. The notebook installs the dependencies, downloads and unzips the dataset from Google Drive (or uses an attached Kaggle input dataset), fetches `er_pipeline.py` and the utilities from this repository (branch `claude/wizardly-cori-snj0nx`), runs the pipeline, validates the two output files and zips the submission package under `/kaggle/working`.
+Upload `notebooks/kaggle_run.ipynb` to Kaggle, enable internet, and run all cells. The notebook installs the dependencies, downloads and unzips the dataset from Google Drive (or uses an attached Kaggle input dataset), fetches the `er` package, `run_pipeline.py` and the utilities from this repository (branch `claude/wizardly-cori-snj0nx`), runs the pipeline, validates the two output files and zips the submission package under `/kaggle/working`.
 
 ### Locally
 
