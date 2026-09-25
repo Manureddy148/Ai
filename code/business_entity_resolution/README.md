@@ -1,41 +1,67 @@
-# Business Entity Resolution: baseline pipeline
+# Business Entity Resolution: pipeline
 
-Single script: `src/er_pipeline.py`. Only the provided train/test files are used (no external lookups).
+Only the provided train/test files are used (no external lookups, no network access at run time).
+
+## Layout
+
+```
+src/
+├── run_pipeline.py        entry point: train -> tune -> test -> output TSVs
+├── er/
+│   ├── normalize.py       name/address normalisation (unidecode ASCII folding, abbreviation
+│   │                      tables, legal-suffix and TLD stripping, postal / house / digit extraction)
+│   ├── blocking.py        hash-key blocking (name, address and house-number keys, per-key cap)
+│   ├── features.py        pairwise features (rapidfuzz cpdist scorers, address agreement, context)
+│   ├── model.py           LightGBM matcher, per-S1 decoding, vectorised macro-F0.5, grid tuning
+│   └── log.py
+└── legacy/er_pipeline_v1.py   first single-file version (TF-IDF top-k blocking); kept for reference
+```
 
 ## Pipeline
-1. **Normalise**: ASCII-fold, lowercase, `&`→`and`, collapse dotted acronyms (`p.v.t.`→`pvt`),
-   split explicit alias markers (`dba`, `d/b/a`, `t/a`, `a.k.a.`, `formerly known as`) into name
-   variants, expand name/address abbreviations (Pvt→private, Rd→road, …), strip legal suffixes
-   (Ltd, LLC, SARL, …) to get a core name, extract the postal code, the digit runs and the leading
-   (house) number of the address.
-2. **Blocking**: for each country (an open set; unseen labels fall back to all records),
-   TF-IDF char 2–4-grams, top-k by core name (k=25), name+address (k=25) and address (k=10), plus
-   a fourth view: same postal code, top-10 by name cosine. Pairs with cosine ≤ 0.05 are dropped.
-   Union → `candidate_pairs.tsv`.
-3. **Features**: TF-IDF cosines of the three views, rapidfuzz ratio / token-sort / token-set /
-   partial / Jaro-Winkler, token Jaccard, first-token and initials agreement, best alias-pair score
-   (`n_alias_best`, `has_alias`), acronym-vs-expansion flag, postal-code and house-number agreement
-   (ternary), street-number overlap/conflict, string lengths, source flag, and contextual features:
-   each pair's gap from the best `cos_full` / `n_tset` / `a_tset` among the same S1's and the same
-   S2/S3 record's candidates, its rank by `cos_full` on both sides, and the candidate counts.
-4. **Matcher**: LightGBM with 5-fold GroupKFold grouped by S1 entity. Decoding: each S2/S3 record is
-   assigned to the S1 that scores it highest (Source 1 is deduplicated); a pair is kept if
-   `p >= thr` **and** `p >= ratio * best_p` within its (S1, source) group. The pair
-   `(thr, ratio)` is swept on out-of-fold predictions (`thr` in 0.20…0.95 step 0.025,
-   `ratio` in {0, 0.6, 0.7, 0.8, 0.9, 1.0}) to maximise **macro F0.5 including singletons**.
+
+1. **Normalise** (`er.normalize.prep`, process pool): `unidecode` folds Devanagari / Tamil /
+   Kannada transliterations and accents to ASCII; lowercase; `&`->`and`; dotted acronyms
+   collapsed; abbreviations expanded; legal suffixes (Pvt, Ltd, LLC, SARL, ...) and web TLDs
+   (`.com`) removed to obtain the core name; addresses lose filler tokens (`near`, `null`, ...);
+   postal code (5-6 digits), house number (first token containing a digit) and the digit runs
+   are extracted.
+2. **Block** (`er.blocking.block`): every record emits keys, all prefixed with the country:
+   first two name tokens, 8-char no-space name prefix, sorted 4-char token prefixes (word
+   reordering), house number + street token, house number + each of the last two address
+   tokens, first name token + house number, or name token + first address token when there is
+   no house number. Keys are hashed to int64; keys shared by more than `--cap` (150) S2/S3
+   records are dropped; pairs are formed by a sorted-array join. The number of shared keys is a
+   feature.
+3. **Features** (`er.features.features`): rapidfuzz `cpdist` (multithreaded) ratio /
+   token-sort / token-set / partial / Jaro-Winkler on core names, token-set / ratio / partial on
+   addresses; postal and house-number agreement (ternary), digit-run overlap / conflict, lengths,
+   token counts, 6-char prefix equality, source flag, non-ASCII flag; context within the S1
+   group: gaps to the best candidate (token-set, address token-set, ratio), rank and candidate
+   count.
+4. **Train** (`er.model.train`): LightGBM binary classifier on a sample of `--train-s1`
+   (150k) S1 entities blocked against their true matches plus `--distractor-frac` (10%) of the
+   S2/S3 pool; early stopping on a held-out 20% of S1 groups.
+5. **Tune**: `--val-s1` (40k) disjoint S1 entities blocked against the **full** training pool
+   (realistic candidate density). Each S2/S3 record is assigned to its best-scoring S1; a pair is
+   kept if `p >= thr` and `p >= ratio * best_p(S1)`. `(thr, ratio)` is grid-searched on the
+   vectorised macro F0.5 (singletons included).
+6. **Test**: all test S1 entities blocked against the full test pool; features and predictions
+   in chunks of `--chunk-pairs` complete S1 groups; decode; write `matching_results.tsv` and
+   `candidate_pairs.tsv` (every pair the model scored).
 
 ## Run
-From the repository root:
-```bash
-pip install -r code/business_entity_resolution/requirements.txt
-python code/business_entity_resolution/src/er_pipeline.py --data-dir dataset --out-dir output
-python3 utils/validate_submission.py --matching output/matching_results.tsv \
-    --candidate output/candidate_pairs.tsv --test-dir dataset/test
-```
-`--data-dir` is the folder containing `train/` and `test/`. In a Kaggle notebook:
-`!python er_pipeline.py --out-dir /kaggle/working/output` (the data dir is auto-detected under
-`/kaggle/input`), or use `notebooks/kaggle_run.ipynb`, which also packages the submission zip.
 
-The log prints the blocking recall ceiling (overall, per country, per source), the blocking oracle
-and all-candidates floor, and the out-of-fold macro F0.5 with the selected `(thr, ratio)`, which is
-the validation score.
+```bash
+pip install -r requirements.txt
+python src/run_pipeline.py --data-dir <dir with train/ and test/> --out-dir output --work-dir work
+python3 ../../utils/validate_submission.py --matching output/matching_results.tsv \
+    --candidate output/candidate_pairs.tsv --test-dir <dir>/test
+```
+
+`--work-dir` caches the normalised frames (parquet), the model and the tuned thresholds;
+`--skip-train` reuses them. Resources for the full challenge data (2.2M / 10.3M train,
+1.7M / 10M test records): 4 CPUs, ~12 GB RAM, ~2 hours.
+
+The log prints: ground-truth statistics, blocking recall (train sample and validation), the
+validation oracle F0.5 (blocking ceiling), the tuned `(thr, ratio)` with its macro F0.5 and
+per-country scores, feature importances, and test match rates per country.

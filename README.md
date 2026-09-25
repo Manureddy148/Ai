@@ -17,7 +17,9 @@ The solution is a single script: text normalisation, per-country TF-IDF char n-g
 │       ├── README.md                  pipeline description and run instructions
 │       ├── requirements.txt           numpy, pandas, scipy, scikit-learn, lightgbm, rapidfuzz
 │       └── src/
-│           └── er_pipeline.py         the whole pipeline (load -> normalise -> block -> features -> LightGBM -> decode -> TSVs)
+│           ├── run_pipeline.py        entry point (train -> tune -> test -> TSVs)
+│           ├── er/                    package: normalize, blocking, features, model
+│           └── legacy/er_pipeline_v1.py  first single-file version
 ├── dataset/                           not committed (see Dataset below)
 │   ├── train/                         train_source{1,2,3}.tsv, train_ground_truth.tsv
 │   └── test/                          test_source{1,2,3}.tsv
@@ -51,7 +53,7 @@ Upload `notebooks/kaggle_run.ipynb` to Kaggle, enable internet, and run all cell
 git clone https://github.com/Manureddy148/Ai && cd Ai
 # unzip the dataset so that dataset/train/ and dataset/test/ exist
 pip install -r code/business_entity_resolution/requirements.txt
-python code/business_entity_resolution/src/er_pipeline.py --data-dir dataset --out-dir output
+python code/business_entity_resolution/src/run_pipeline.py --data-dir dataset --out-dir output --work-dir work
 python3 utils/validate_submission.py --matching output/matching_results.tsv \
     --candidate output/candidate_pairs.tsv --test-dir dataset/test
 ```
@@ -60,7 +62,7 @@ python3 utils/validate_submission.py --matching output/matching_results.tsv \
 
 ```bash
 python3 utils/make_synthetic_dataset.py /tmp/synth
-python code/business_entity_resolution/src/er_pipeline.py --data-dir /tmp/synth --out-dir /tmp/synth_out
+python code/business_entity_resolution/src/run_pipeline.py --data-dir /tmp/synth --out-dir /tmp/synth_out --work-dir /tmp/synth_work --train-s1 2000 --val-s1 800 --distractor-frac 0.5
 python3 utils/validate_submission.py --matching /tmp/synth_out/matching_results.tsv \
     --candidate /tmp/synth_out/candidate_pairs.tsv --test-dir /tmp/synth/test
 python3 utils/score.py --pred /tmp/synth_out/matching_results.tsv \
